@@ -1,11 +1,163 @@
 # FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects
 [[Paper]](https://arxiv.org/abs/2312.08344) [[Website]](https://nvlabs.github.io/FoundationPose/)
 
-# TYLER DOCUMENTATION (September 8, 2024)
+## ROS2 Port
+
+This fork ports the ROS nodes from ROS1 (rospy) to ROS2 (rclpy),
+for integration with the Object-Informed MPPI pipeline (ROS2-based).
+
+### What changed
+- `fp_ros_node.py`, `fp_evaluator_ros_node.py`, `fp_ros_utils.py`:
+  ported from rospy to rclpy. Pose is now published as `PoseStamped`
+  (was `Pose`) on `/object_pose`, adding a timestamp.
+- Parameters are passed via ROS2 args, e.g.
+  `--ros-args -p camera:=realsense -p mesh_file:=/path/to/mesh.ply`
+- `visualize` is now a ROS2 parameter (default true) instead of a
+  hardcoded debug level.
+- Evaluator: added an optional depth-based check (`use_depth_check`,
+  default false) on top of mask IoU, to catch z-axis pose errors that
+  the 2D silhouette misses.
+
+### Setup & Run (ROS2)
+ 
+**Environment**:
+- conda `my` (Python 3.11), inside the container: SAM2 + FoundationPose inference + ROS2 Humble + rclpy.
+- **RealSense runs on the host** (librealsense 2.58, ROS2 Jazzy), not in the container. The container's librealsense 2.55 mismatches the D455's firmware 5.17, which throttles depth. The container subscribes to the camera topics over DDS instead. See Terminal 1 below.
+#### 0. Build images (only when something changed)
+ 
+```bash
+cd ~/workspace/FoundationPose
+ 
+# base image (Python 3.11, torch 2.5.1+cu121, pytorch3d, nvdiffrast)
+docker build -t foundationpose -f docker/dockerfile .
+ 
+# ROS2 + SAM2 + RealSense integration image
+docker build -t ros2_sam2_foundationpose -f docker/ros2_sam2_dockerfile .
+```
+ 
+The base image takes ~20min (pytorch3d source build); the second takes a while too (RoboStack install). If only code changed, just restart the container, no rebuild needed.
+ 
+**Post-build check** (inside the container, all 7 must pass):
+```bash
+conda activate my
+python3 -c "import torch; print('torch', torch.__version__)"  # 2.5.1+cu121
+python3 -c "from sam2 import _C; print('_C OK')"  # _C OK
+python3 -c "import rclpy; print('rclpy OK')"
+python3 -c "import numpy; print('numpy', numpy.__version__)"  # 1.26.4
+python3 -c "import trimesh, scipy, cv2; print('fp deps OK')"
+python3 -c "import nvdiffrast.torch; print('nvdiffrast OK')"
+ros2 pkg list | grep realsense  # realsense2_camera
+```
+ 
+#### 1. Start the container
+ 
+```bash
+cd ~/workspace/FoundationPose
+bash docker/run_ros2_sam2_container.sh
+```
+ 
+For additional terminals:
+```bash
+docker exec -it ros2_sam2_foundationpose bash
+```
+ 
+`PYTHONPATH`/`LD_LIBRARY_PATH` are set automatically on activating `my` (via `activate.d/zzz_env.sh`) — no manual export needed.
+ 
+#### 2. One-time: build mycpp
+ 
+FoundationPose is mounted at runtime, not baked into the image, so the `mycpp` C++ extension must be built once inside the container (Python 3.11 → `cpython-311`). It's on the mounted path, so this build persists.
+ 
+```bash
+conda activate my
+cd ~/workspace/FoundationPose/mycpp
+rm -rf build && mkdir build && cd build
+cmake .. && make -j
+# result: mycpp/build/mycpp.cpython-311-x86_64-linux-gnu.so
+```
+ 
+#### 3. Run the pipeline (4 terminals, all `conda activate my` unless noted)
+ 
+**Terminal 1 — RealSense (on the host, not in the container)**
+ 
+The container's librealsense 2.55 causes `control_transfer` spam and throttles depth to 0.2-8Hz. The host's librealsense 2.58 matches the D455 firmware and gives a clean 30Hz; the container subscribes over DDS.
+ 
+**Deactivate conda here** — conda's Python shadows the system ROS2 Jazzy Python and causes an `rclpy._rclpy_pybind11` ImportError.
+ 
+Namespace must be `/` and name `camera` so topics come out as `/camera/color/image_raw` (the code's expected format), not the default `/camera/camera/...`. `camera_namespace:=''` (empty string) is rejected by the launch parser — use `camera_namespace:=/`.
+ 
+```bash
+# host terminal, conda deactivated
+conda deactivate
+source /opt/ros/jazzy/setup.bash
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml
+ 
+ros2 launch realsense2_camera rs_launch.py \
+    align_depth.enable:=true \
+    camera_namespace:=/ \
+    camera_name:=camera \
+    rgb_camera.color_profile:=640x480x30 \
+    depth_module.depth_profile:=640x480x30
+```
+ 
+Check (`ros2 topic hz` gives false readings due to QoS mismatch — use echo'd timestamp intervals instead; 0.033s = 30Hz):
+```bash
+# host terminal, same conda-deactivated + jazzy-sourced setup
+ros2 topic echo /camera/color/image_raw --no-arr --field header.stamp
+ros2 topic echo /camera/aligned_depth_to_color/image_raw --no-arr --field header.stamp
+```
+ 
+If `control_transfer ... Resource temporarily unavailable` warnings are **not** spamming and color/depth are at 30Hz, it's working. If they spam, it's running against the container's librealsense instead of the host's — recheck your conda/env.
+ 
+> ⚠️ **DDS depth loss**: depth (848x480) can overflow the default DDS buffers and drop in bursts of 4 frames — this goes away once the container's `CYCLONEDDS_URI` points to a valid `cyclonedds.xml`. If `echo $CYCLONEDDS_URI` is empty in the container, depth breaks again — always check this in whichever shell launches FoundationPose (Terminal 3).
+ 
+**Terminal 2 — SAM2**
+```bash
+conda activate my
+cd /opt/sam2
+python3 sam2_ros_node.py --ros-args -p camera:=realsense
+```
+Click the object once when the window appears. Once `Mask initialized` prints, the mask publishes on `/sam2_mask`.
+ 
+Optional mask check (new terminal):
+```bash
+conda activate my
+ros2 run rqt_image_view rqt_image_view   
+# Then, select /sam2_mask, /fp_render_mask, /fp_depth_residual, or /fp_debug_overlay from the dropdown
+```
+ 
+**Terminal 3 — FoundationPose**
+```bash
+conda activate my
+cd ~/workspace/FoundationPose
+python3 fp_ros_node.py --ros-args \
+    -p camera:=realsense \
+    -p mesh_file:=/path/to/object.ply
+```
+`self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
+ 
+**Terminal 4 — TF frame broadcast**
+```bash
+conda activate my
+cd ~/workspace/FoundationPose
+python3 fp_tf_broadcaster.py --ros-args \
+    -p npz_path:=camera_036322250488_extrinsics.npz \
+    -p robot_frame:=xarm_device \
+    -p camera_frame:=fp_camera_color_optical_frame
+```
+
+**Terminal 5 — Check output (Optional)**
+```bash
+conda activate my
+ros2 topic hz /object_pose
+ros2 topic echo /object_pose
+```
+
+## TYLER DOCUMENTATION (September 8, 2024)
 
 NOTE: The purpose of this documentation is NOT to be super precise and detailed, but rather to be a quick reference for how to run the code and how it works.
 
-## EXAMPLE VIDEO
+### EXAMPLE VIDEO
 
 This is an example that demonstrates the reasonable robustness FoundationPose, with the help of the Segment Anything Model 2 (SAM2) model to initialize FoundationPose and reset FoundationPose when the object is lost. If the SAM2 mask (very accurate) is very different from the FoundationPose prediction's mask (less accurate), the tracker will reset.
 
@@ -13,9 +165,9 @@ This video shows FoundationPose working at ~40Hz.
 
 [2024-09-08_SAM2_FP_Robust_compressed.webm](https://github.com/user-attachments/assets/892a984a-571d-4451-bf69-15415800981c)
 
-## INPUTS AND OUTPUTS
+### INPUTS AND OUTPUTS
 
-### FP ROS NODE
+#### FP ROS NODE
 
 ```mermaid
 flowchart LR
@@ -45,7 +197,7 @@ flowchart LR
 * `fp_reset` is a boolean trigger to reset the pose estimation model
 * `object_pose` is the estimated 6D pose of the detected object (in camera frame)
 
-### FP EVALUATOR ROS NODE
+#### FP EVALUATOR ROS NODE
 
 ```mermaid
 flowchart LR
@@ -96,7 +248,7 @@ elif camera == "realsense":
     self.camera_info_sub_topic = "/camera/color/camera_info"
 ```
 
-## CHANGES
+### CHANGES
 
 * Addition of `docker/ros_dockerfile` and `docker/run_ros_container.sh` to add ROS Noetic installation with Robostack (https://robostack.github.io/GettingStarted.html)
 
