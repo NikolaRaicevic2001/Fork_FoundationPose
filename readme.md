@@ -133,7 +133,7 @@ docker exec -it ros2_sam2_foundationpose bash
 cd ~/{workspace}/Fork_FoundationPose
 python3 fp_ros_node.py --ros-args \
     -p camera:=realsense \
-    -p mesh_file:=/path/to/object.ply
+    -p mesh_file:=/path/to/object.ply  # You can find some objects' meshes in meshes directory. e.g. meshes/T_block/T_block.ply
 ```
 `self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
  
