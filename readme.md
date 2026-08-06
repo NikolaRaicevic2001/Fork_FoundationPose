@@ -114,7 +114,7 @@ If `control_transfer ... Resource temporarily unavailable` warnings are **not** 
  
 **Terminal 2 — SAM2**
 ```bash
-conda activate my
+bash docker/run_ros2_sam2_container.sh
 cd /opt/sam2
 python3 sam2_ros_node.py --ros-args -p camera:=realsense
 ```
@@ -122,15 +122,15 @@ Click the object once when the window appears. Once `Mask initialized` prints, t
  
 Optional mask check (new terminal):
 ```bash
-conda activate my
+docker exec -it ros2_sam2_foundationpose bash
 ros2 run rqt_image_view rqt_image_view   
 # Then, select /sam2_mask, /fp_render_mask, /fp_depth_residual, or /fp_debug_overlay from the dropdown
 ```
  
 **Terminal 3 — FoundationPose**
 ```bash
-conda activate my
-cd ~/workspace/FoundationPose
+docker exec -it ros2_sam2_foundationpose bash
+cd ~/{workspace}/FoundationPose
 python3 fp_ros_node.py --ros-args \
     -p camera:=realsense \
     -p mesh_file:=/path/to/object.ply
@@ -139,7 +139,7 @@ python3 fp_ros_node.py --ros-args \
  
 **Terminal 4 — TF frame broadcast**
 ```bash
-conda activate my
+docker exec -it ros2_sam2_foundationpose bash
 cd ~/workspace/FoundationPose
 python3 fp_tf_broadcaster.py --ros-args \
     -p npz_path:=camera_036322250488_extrinsics.npz \
@@ -149,7 +149,7 @@ python3 fp_tf_broadcaster.py --ros-args \
 
 **Terminal 5 — Check output (Optional)**
 ```bash
-conda activate my
+docker exec -it ros2_sam2_foundationpose bash
 ros2 topic hz /object_pose
 ros2 topic echo /object_pose
 ```
