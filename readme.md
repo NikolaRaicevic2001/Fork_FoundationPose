@@ -26,7 +26,7 @@ for integration with the Object-Informed MPPI pipeline (ROS2-based).
 #### 0. Build images (only when something changed)
  
 ```bash
-cd ~/workspace/FoundationPose
+cd ~/{workspace}/Fork_FoundationPose
  
 # base image (Python 3.11, torch 2.5.1+cu121, pytorch3d, nvdiffrast)
 docker build -t foundationpose -f docker/dockerfile .
@@ -52,7 +52,7 @@ ros2 pkg list | grep realsense  # realsense2_camera
 #### 1. Start the container
  
 ```bash
-cd ~/workspace/FoundationPose
+cd ~/{workspace}/Fork_FoundationPose
 bash docker/run_ros2_sam2_container.sh
 ```
  
@@ -69,7 +69,7 @@ FoundationPose is mounted at runtime, not baked into the image, so the `mycpp` C
  
 ```bash
 conda activate my
-cd ~/workspace/FoundationPose/mycpp
+cd ~/{workspace}/Fork_FoundationPose/mycpp
 rm -rf build && mkdir build && cd build
 cmake .. && make -j
 # result: mycpp/build/mycpp.cpython-311-x86_64-linux-gnu.so
@@ -130,7 +130,7 @@ ros2 run rqt_image_view rqt_image_view
 **Terminal 3 — FoundationPose**
 ```bash
 docker exec -it ros2_sam2_foundationpose bash
-cd ~/{workspace}/FoundationPose
+cd ~/{workspace}/Fork_FoundationPose
 python3 fp_ros_node.py --ros-args \
     -p camera:=realsense \
     -p mesh_file:=/path/to/object.ply
@@ -140,7 +140,7 @@ python3 fp_ros_node.py --ros-args \
 **Terminal 4 — TF frame broadcast**
 ```bash
 docker exec -it ros2_sam2_foundationpose bash
-cd ~/workspace/FoundationPose
+cd ~/{workspace}/Fork_FoundationPose
 python3 fp_tf_broadcaster.py --ros-args \
     -p npz_path:=camera_036322250488_extrinsics.npz \
     -p robot_frame:=xarm_device \
