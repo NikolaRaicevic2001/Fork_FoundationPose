@@ -164,12 +164,20 @@ class ArucoObstacleNode(Node):
             n_rej = len(rejected) if rejected else 0
             cv2.putText(vis, f"detected: {n_seen}  rejected: {n_rej}",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            # Temp file keeps the .jpg extension -- imwrite picks its
-            # codec from the extension, so ".tmp" alone would fail.
-            root, ext = os.path.splitext(VIS_PATH)
-            tmp_path = f"{root}.tmp{ext}"
-            cv2.imwrite(tmp_path, vis)
-            os.replace(tmp_path, VIS_PATH)  # atomic -- viewer never sees a partial write
+            try:
+                # Temp file keeps the .jpg extension -- imwrite picks its
+                # codec from the extension, so ".tmp" alone would fail.
+                root, ext = os.path.splitext(VIS_PATH)
+                tmp_path = f"{root}.tmp{ext}"
+                if not cv2.imwrite(tmp_path, vis):
+                    raise IOError(f"cv2.imwrite returned False for {tmp_path}")
+                os.replace(tmp_path, VIS_PATH)  # atomic -- viewer never sees a partial write
+            except Exception as e:
+                # The viewer is a convenience, not the pipeline -- detection
+                # and /obstacle_pose publishing above must never go down
+                # because a debug frame couldn't be written to disk.
+                self.get_logger().warn(f"vis frame write failed: {e}",
+                                       throttle_duration_sec=5.0)
 
     def publish_pose(self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray,
                       stamp) -> None:
