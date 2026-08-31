@@ -116,7 +116,7 @@ If `control_transfer ... Resource temporarily unavailable` warnings are **not** 
 ```bash
 bash docker/run_ros2_sam2_container.sh
 cd /opt/sam2
-python3 sam2_ros_node.py --ros-args -p camera:=realsense -p frequency:=10.0
+python3 sam2_ros_node.py --ros-args -p camera:=realsense -p frequency:=3.0
 ```
 Click the object once when the window appears. Once `Mask initialized` prints, the mask publishes on `/sam2_mask`.
  
