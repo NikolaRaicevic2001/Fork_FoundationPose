@@ -12,6 +12,7 @@ import numpy as np
 import cv2
 import torch
 import nvdiffrast.torch as dr
+import open3d as o3d
 import rclpy
 import trimesh
 
@@ -26,6 +27,7 @@ from sensor_msgs.msg import Image as ROSImage
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from fp_ros_utils import get_mesh_file
 from Utils import (
+    depth2xyzmap,
     draw_posed_3d_box,
     draw_xyz_axis,
     nvdiffrast_render,
@@ -88,6 +90,57 @@ class FoundationPoseROS2(Node):
         # object is heavily occluded => hold, never reset on this frame.
         self.depth_residual_heavy_occ_frac = 0.6
 
+        # ---- Table-plane constraint --------------------------------------
+        # Pushing happens on a table, so the object rests on a known plane. That
+        # removes exactly the freedoms tracking drifts into when occlusion makes
+        # the observation partial: floating off the surface and tilting over.
+        # Unlike the centroid / depth / IoU criteria this uses no SAM2 mask and
+        # no per-frame depth, so occlusion cannot corrupt it.
+        #   off     : disabled
+        #   detect  : measure float height + tilt, use them to trigger a reset
+        #   correct : additionally snap the pose back onto the plane each frame
+        # Toggle at launch with -p plane_mode:=off|detect|correct
+        self.declare_parameter("plane_mode", "detect")
+        self.plane_mode = self.get_parameter(
+            "plane_mode").get_parameter_value().string_value
+        if self.plane_mode not in ("off", "detect", "correct"):
+            raise ValueError(f"Unknown plane_mode: {self.plane_mode}")
+        # Float tolerance is tight: an object resting on a table should not
+        # hover. Tilt tolerance is deliberately loose -- for flat/elongated
+        # meshes (banana) the reference axis is far less meaningful, so a
+        # generous bound avoids false resets.
+        self.declare_parameter("plane_max_float_m", 0.02)
+        self.plane_max_float_m = self.get_parameter(
+            "plane_max_float_m").get_parameter_value().double_value
+        self.declare_parameter("plane_max_tilt_deg", 25.0)
+        self.plane_max_tilt_deg = self.get_parameter(
+            "plane_max_tilt_deg").get_parameter_value().double_value
+        # Own counter/patience so plane tuning stays independent of the
+        # centroid / depth-residual criteria.
+        self.declare_parameter("plane_patience", 5)
+        self.plane_patience = self.get_parameter(
+            "plane_patience").get_parameter_value().integer_value
+        self.declare_parameter("plane_fit_thresh_m", 0.01)
+        self.plane_fit_thresh_m = self.get_parameter(
+            "plane_fit_thresh_m").get_parameter_value().double_value
+        # In "correct" mode, which freedoms to snap back. Height is on by
+        # default (a resting object cannot hover); tilt is off by default
+        # because forcing an axis is the risky half of the constraint.
+        self.declare_parameter("plane_correct_float", True)
+        self.plane_correct_float = self.get_parameter(
+            "plane_correct_float").get_parameter_value().bool_value
+        self.declare_parameter("plane_correct_tilt", False)
+        self.plane_correct_tilt = self.get_parameter(
+            "plane_correct_tilt").get_parameter_value().bool_value
+
+        # Plane state, all in the camera frame. Signed distance of a point X is
+        # (plane_n . X + plane_d), positive on the camera side of the table.
+        self.plane_n = None
+        self.plane_d = None
+        self.plane_u_ref = None  # object-frame axis that pointed "up" at reg.
+        self.plane_rest_offset = 0.0  # lowest-point distance when at rest
+        self.plane_violation_counter = 0
+
         # Refinement iterations
         self.first_est_refine_iter = 5  # Higher quality for first registration
         self.est_refine_iter = 1  # Fast re-init when reset triggered
@@ -127,6 +180,14 @@ class FoundationPoseROS2(Node):
         self.to_origin, extents = trimesh.bounds.oriented_bounds(
             self.object_mesh)
         self.bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
+
+        # Subsampled mesh vertices, used to find the object's lowest point above
+        # the table each frame. Same convention as the pose published below.
+        mesh_v = np.asarray(self.object_mesh.vertices, dtype=np.float64)
+        if len(mesh_v) > 5000:
+            mesh_v = mesh_v[np.random.default_rng(0).choice(
+                len(mesh_v), 5000, replace=False)]
+        self.plane_pts = mesh_v
 
         # FoundationPose model init
         self.scorer = ScorePredictor()
@@ -266,6 +327,13 @@ class FoundationPoseROS2(Node):
         self.is_object_registered = True
         self.first = False
         self.pose_last_prev = None  # reset CV-prior history after re-registration
+        self.plane_violation_counter = 0
+        # Fit the table once, from the first (highest-quality) registration.
+        # Later re-registrations reuse it: the camera and table do not move, and
+        # re-deriving the reference from a mediocre re-registration would bake
+        # that error into the constraint.
+        if self.plane_mode != "off" and self.plane_n is None:
+            self._init_plane_reference(depth, mask, cam_K, pose)
 
     def _track(self):
         """Frame-to-frame tracking."""
@@ -284,6 +352,10 @@ class FoundationPoseROS2(Node):
                                       iteration=self.track_refine_iter)
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
+
+        # Snap the pose back onto the table before anything downstream sees it.
+        if self.plane_mode == "correct":
+            pose = self.apply_plane_correction(pose)
 
         # Render the FP depth once and reuse it for both debug viz and the
         # depth-residual reset (avoids rendering the mesh twice per frame).
@@ -451,6 +523,11 @@ class FoundationPoseROS2(Node):
         was triggered. Depth-residual mode catches rotation drift that leaves
         the centroid in place; centroid mode is the translation-only fallback."""
 
+        # Plane violation is checked first, independently of
+        # use_auto_reset, so it can be A/B tested on its own.
+        if self.check_reset_plane(pose):
+            return True
+
         if not self.use_auto_reset:
             return False
 
@@ -563,6 +640,170 @@ class FoundationPoseROS2(Node):
             return True
 
         return False
+
+    # ---------- table-plane constraint ----------
+
+    def _init_plane_reference(self, depth, mask, cam_K, pose):
+        """Fit the table plane by RANSAC on the scene point cloud, then record
+        what "at rest" looks like for this object: how high its lowest vertex
+        sits, and which object-frame axis points along the table normal. Later
+        frames are measured against these references, so a small constant bias
+        in the mesh or the depth image cannot by itself raise a violation."""
+        try:
+            valid = depth > 0.001
+            if mask is not None and mask.shape == depth.shape:
+                # Drop the object (generously) so it is not fitted as table.
+                k = 2 * 20 + 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                grown = cv2.dilate((mask > 0).astype(np.uint8), kernel) > 0
+                valid &= ~grown
+
+            pts = depth2xyzmap(depth, cam_K)[valid].reshape(-1, 3)
+            pts = pts[np.isfinite(pts).all(axis=1)]
+            if len(pts) < 500:
+                self.get_logger().warn(
+                    f"Plane fit skipped: only {len(pts)} scene points")
+                return
+            if len(pts) > 60000:
+                pts = pts[np.random.default_rng(0).choice(
+                    len(pts), 60000, replace=False)]
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts)
+            model, inliers = pcd.segment_plane(
+                distance_threshold=self.plane_fit_thresh_m,
+                ransac_n=3,
+                num_iterations=500)
+            n = np.asarray(model[:3], dtype=np.float64)
+            d = float(model[3])
+            norm = np.linalg.norm(n)
+            if norm < 1e-9:
+                self.get_logger().warn("Plane fit produced a degenerate normal")
+                return
+            n, d = n / norm, d / norm
+            # The camera sits above the table, and its origin's signed distance
+            # is exactly d -- so flip the plane until d is positive. "Above the
+            # table" is then the positive side for every point.
+            if d < 0:
+                n, d = -n, -d
+
+            self.plane_n, self.plane_d = n, d
+            # Object-frame direction that currently points along the normal.
+            # Defined this way, tilt is 0 at registration for any mesh, so no
+            # assumption about which axis is "up" is needed.
+            self.plane_u_ref = pose[:3, :3].T @ n
+            self.plane_rest_offset = 0.0
+            metrics = self.plane_metrics(pose)
+            if metrics is not None:
+                self.plane_rest_offset = metrics[0]
+
+            self.get_logger().info(
+                f"Table plane fit: normal={np.round(n, 3)}, "
+                f"{len(inliers)}/{len(pts)} inliers, "
+                f"rest offset={self.plane_rest_offset * 1000:.1f} mm")
+        except Exception as e:  # never let plane setup break registration
+            self.get_logger().warn(f"Plane fit failed: {e}")
+
+    def plane_metrics(self, pose: np.ndarray):
+        """Return (float_height_m, tilt_deg), or None if the plane is not known.
+
+        float_height is how far the object's centroid sits above its resting
+        height (negative = sunk into the table). The centroid, not the lowest
+        vertex, is used on purpose: rotating an object moves its lowest vertex,
+        which would make the height reading rise and fall with tilt and couple
+        the two thresholds together. Measuring the centroid keeps height purely
+        translational, so the tilt bound can stay loose (for flat meshes like a
+        banana) while the height bound stays tight.
+        """
+        if self.plane_n is None or self.plane_u_ref is None:
+            return None
+        rot, trans = pose[:3, :3], pose[:3, 3]
+        centroid = rot @ self.plane_pts.mean(axis=0) + trans
+        height = float(centroid @ self.plane_n + self.plane_d)
+        up_now = rot @ self.plane_u_ref
+        cos = float(np.clip(np.dot(up_now, self.plane_n), -1.0, 1.0))
+        return height - self.plane_rest_offset, float(np.degrees(np.arccos(cos)))
+
+    def check_reset_plane(self, pose: np.ndarray) -> bool:
+        """Reset when the object has been off the table -- floating, sunk, or
+        tilted -- for `plane_patience` frames. Uses its own counter so it can be
+        tuned and A/B tested independently of the other criteria."""
+        if self.plane_mode == "off":
+            return False
+        metrics = self.plane_metrics(pose)
+        if metrics is None:
+            return False
+        float_h, tilt = metrics
+
+        violated = (abs(float_h) > self.plane_max_float_m
+                    or tilt > self.plane_max_tilt_deg)
+        if violated:
+            self.plane_violation_counter += 1
+        else:
+            self.plane_violation_counter = max(
+                0, self.plane_violation_counter - 1)
+
+        if self.plane_violation_counter >= self.plane_patience:
+            self.get_logger().warn(
+                f"Off the table (float {float_h * 1000:+.0f}mm, "
+                f"tilt {tilt:.0f}deg). Auto-reset triggered.")
+            self.is_object_registered = False
+            self.plane_violation_counter = 0
+            return True
+        return False
+
+    def apply_plane_correction(self, pose: np.ndarray) -> np.ndarray:
+        """Project the pose back onto the table and feed the correction back
+        into FoundationPose's own state.
+
+        Writing the result into `pose_last` is the point: tracking is
+        frame-to-frame, so an uncorrected drift is the starting guess for the
+        next frame and compounds. Re-anchoring every frame means error simply
+        cannot accumulate along the constrained freedoms."""
+        metrics = self.plane_metrics(pose)
+        if metrics is None:
+            return pose
+
+        corrected = pose.copy()
+        n = self.plane_n
+
+        # 1) Tilt: rotate by the minimal rotation that brings the reference axis
+        # back onto the normal, about the object's own center so it does not
+        # translate as a side effect.
+        if self.plane_correct_tilt:
+            up_now = corrected[:3, :3] @ self.plane_u_ref
+            axis = np.cross(up_now, n)
+            sin_a = float(np.linalg.norm(axis))
+            if sin_a > 1e-8:
+                angle = float(np.arctan2(sin_a, float(np.dot(up_now, n))))
+                rot_c = R.from_rotvec(axis / sin_a * angle).as_matrix()
+                center = corrected[:3, 3]
+                tf = np.eye(4)
+                tf[:3, :3] = rot_c
+                tf[:3, 3] = center - rot_c @ center
+                corrected = tf @ corrected
+
+        # 2) Height: slide along the normal until the lowest vertex is back at
+        # its resting height.
+        if self.plane_correct_float:
+            metrics = self.plane_metrics(corrected)
+            if metrics is not None:
+                tf = np.eye(4)
+                tf[:3, 3] = -metrics[0] * n
+                corrected = tf @ corrected
+
+        # The correction is a left-multiply in the camera frame, so it applies
+        # unchanged to FoundationPose's internal pose convention.
+        delta = corrected @ np.linalg.inv(pose)
+        pose_last = self.FPModel.pose_last
+        if pose_last is not None:
+            updated = delta @ pose_last.detach().cpu().numpy().reshape(4, 4)
+            u, _, vt = np.linalg.svd(updated[:3, :3])  # guard against drift
+            updated[:3, :3] = u @ vt
+            self.FPModel.pose_last = torch.as_tensor(updated,
+                                                     dtype=pose_last.dtype,
+                                                     device=pose_last.device)
+        return corrected
 
     # ---------- FP mesh rendering + depth residual ----------
 
@@ -696,6 +937,15 @@ class FoundationPoseROS2(Node):
                    f"(min covis={self.depth_residual_min_covisible_px})")
         cv2.putText(overlay, txt, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 255), 2, cv2.LINE_AA)
+
+        # Table-plane diagnostics (independent of SAM2 and of depth noise)
+        plane = self.plane_metrics(pose)
+        if plane is not None:
+            cv2.putText(
+                overlay,
+                f"float={plane[0] * 1000:+.0f}mm  tilt={plane[1]:.0f}deg",
+                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 128, 0), 2,
+                cv2.LINE_AA)
 
         try:
             self.debug_overlay_pub.publish(
