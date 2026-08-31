@@ -22,6 +22,7 @@ import trimesh
 from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
 from std_msgs.msg import Int32
 from sensor_msgs.msg import CameraInfo
@@ -80,7 +81,14 @@ class FoundationPoseROS2(Node):
         self.use_auto_reset = True
         self.auto_reset_patience = 3  # Consecutive frames required to trigger reset
         self.drift_counter = 0
-        self.max_center_dist_px = 30.0  # Max pixel distance between SAM2 and FP centers
+        # Relaxed from 30 px: in a clean 428 s run the centroid crossed 30 px on
+        # 10 frames while the plane criterion stayed flat (tilt < 5 deg, height
+        # < 8 mm) -- i.e. those were momentary SAM2 mask lag, not pose error.
+        # The plane criterion now covers the real failures, so this one no
+        # longer has to be twitchy.
+        self.declare_parameter("max_center_dist_px", 50.0)
+        self.max_center_dist_px = self.get_parameter(
+            "max_center_dist_px").get_parameter_value().double_value
 
         # Reset mode: centroid distance (translation-only) vs depth residual.
         # Depth residual compares the FP-rendered depth against observed depth
@@ -120,7 +128,9 @@ class FoundationPoseROS2(Node):
         # hover. Tilt tolerance is deliberately loose -- for flat/elongated
         # meshes (banana) the reference axis is far less meaningful, so a
         # generous bound avoids false resets.
-        self.declare_parameter("plane_max_float_m", 0.02)
+        # 30 mm: the worst height excursion observed across a clean run was
+        # 12.4 mm (sd 1.3 mm), so this keeps ~2.5x margin over normal jitter.
+        self.declare_parameter("plane_max_float_m", 0.03)
         self.plane_max_float_m = self.get_parameter(
             "plane_max_float_m").get_parameter_value().double_value
         self.declare_parameter("plane_max_tilt_deg", 25.0)
@@ -143,6 +153,31 @@ class FoundationPoseROS2(Node):
         self.declare_parameter("plane_correct_tilt", False)
         self.plane_correct_tilt = self.get_parameter(
             "plane_correct_tilt").get_parameter_value().bool_value
+
+        # ---- Symmetry-aware pose canonicalisation ------------------------
+        # A flat, texture-less block looks identical after a 180 deg flip, so
+        # registration picks between the two representations essentially at
+        # random (observed: 3 of 5 registrations landed on the opposite one).
+        # Both are valid descriptions of the same physical placement, but a
+        # consumer that reads the axis literally -- the downstream planner --
+        # sees the object flip for no reason.
+        #
+        # So: pick the representation whose named object axis points along the
+        # table normal, using a symmetry of the mesh itself. Because the mesh is
+        # symmetric under that transform, nothing is lost. If NO symmetry can
+        # fix the direction, the pose is left untouched: that is a genuine
+        # flip, and the plane tilt criterion should report it rather than have
+        # it silently rewritten.
+        # Set e.g. -p canonical_up_axis:=-z  (empty string disables it).
+        self.declare_parameter("canonical_up_axis", "")
+        axis_str = self.get_parameter(
+            "canonical_up_axis").get_parameter_value().string_value.strip()
+        self.canonical_axis = self._parse_axis(axis_str) if axis_str else None
+        self.declare_parameter("symmetry_tol", 0.02)
+        self.symmetry_tol = self.get_parameter(
+            "symmetry_tol").get_parameter_value().double_value
+        self.symmetry_tfs = []  # object-frame 4x4 self-mappings of the mesh
+        self.canon_applied = False
 
         # Plane state, all in the camera frame. Signed distance of a point X is
         # (plane_n . X + plane_d), positive on the camera side of the table.
@@ -221,6 +256,8 @@ class FoundationPoseROS2(Node):
             mesh_v = mesh_v[np.random.default_rng(0).choice(
                 len(mesh_v), 5000, replace=False)]
         self.plane_pts = mesh_v
+        if self.canonical_axis is not None:
+            self.symmetry_tfs = self._detect_symmetries()
 
         # FoundationPose model init
         self.scorer = ScorePredictor()
@@ -372,7 +409,12 @@ class FoundationPoseROS2(Node):
         # re-deriving the reference from a mediocre re-registration would bake
         # that error into the constraint.
         if self.plane_mode != "off" and self.plane_n is None:
-            self._init_plane_reference(depth, mask, cam_K, pose)
+            self._fit_table_plane(depth, mask, cam_K)
+        # Canonicalise BEFORE capturing the rest reference, so the reference is
+        # recorded in the same representation every later frame is compared in.
+        pose = self.canonicalize_pose(pose)
+        if self.plane_n is not None and self.plane_u_ref is None:
+            self._capture_rest_reference(pose)
 
     def _track(self):
         """Frame-to-frame tracking."""
@@ -393,6 +435,10 @@ class FoundationPoseROS2(Node):
         # Once a second is enough to watch the rate; per-frame is just noise.
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms",
                                throttle_duration_sec=1.0)
+
+        # Normalise the symmetry representation first, so every measurement and
+        # everything published below refers to the same one.
+        pose = self.canonicalize_pose(pose)
 
         # Measure the plane criterion on the RAW pose, before any correction:
         # in correct mode the correction would otherwise erase the very signal
@@ -446,6 +492,7 @@ class FoundationPoseROS2(Node):
                 else round((plane_post[0] - plane_pre[0]) * 1000, 2),
                 corr_tilt_deg=None if (plane_pre is None or plane_post is None)
                 else round(plane_post[1] - plane_pre[1], 2),
+                canon=int(self.canon_applied),
                 drift_counter=self.drift_counter,
                 plane_counter=self.plane_violation_counter,
                 reset=int(did_reset),
@@ -744,7 +791,7 @@ class FoundationPoseROS2(Node):
         # depth-residual criterion
         "depth_res_m", "n_covisible", "occ_frac",
         # reset bookkeeping
-        "drift_counter", "plane_counter", "reset", "reset_reason",
+        "canon", "drift_counter", "plane_counter", "reset", "reset_reason",
     ]
 
     def _open_log(self):
@@ -816,14 +863,100 @@ class FoundationPoseROS2(Node):
                     out["depth_res_m"] = round(res, 5)
         return out
 
+    # ---------- symmetry canonicalisation ----------
+
+    @staticmethod
+    def _parse_axis(text: str) -> np.ndarray:
+        """Parse '+z' / '-z' / 'x' ... into a unit vector in the object frame."""
+        text = text.lower().replace(" ", "")
+        sign = -1.0 if text.startswith("-") else 1.0
+        letter = text.lstrip("+-")
+        if letter not in ("x", "y", "z"):
+            raise ValueError(f"canonical_up_axis must be +/-x|y|z, got: {text}")
+        vec = np.zeros(3)
+        vec["xyz".index(letter)] = sign
+        return vec
+
+    def _detect_symmetries(self):
+        """Find 180 deg rotations that map the mesh onto itself, tested about the
+        oriented-bounding-box axes (the object's own principal directions, which
+        need not match the mesh file's axes).
+
+        Symmetry is measured by nearest-neighbour distance rather than voxel
+        overlap: mesh vertices are not uniformly sampled, so an occupancy test
+        scores vertex placement as much as shape. Observed separation is wide --
+        symmetric ~0.01 of the diameter, asymmetric >0.03 -- so the threshold is
+        not delicate."""
+        verts = np.asarray(self.object_mesh.vertices, dtype=np.float64)
+        if len(verts) > 20000:
+            verts = verts[np.random.default_rng(0).choice(
+                len(verts), 20000, replace=False)]
+        center = (verts.min(axis=0) + verts.max(axis=0)) / 2.0
+        local = verts - center
+        diameter = float(np.linalg.norm(local.max(axis=0) - local.min(axis=0)))
+        if diameter < 1e-6:
+            return []
+
+        tree = cKDTree(local)
+        axes = self.to_origin[:3, :3]  # OBB axes expressed in the mesh frame
+        found = []
+        for i in range(3):
+            axis = axes[i] / np.linalg.norm(axes[i])
+            rot = 2.0 * np.outer(axis, axis) - np.eye(3)  # 180 deg about axis
+            dist, _ = tree.query(local @ rot.T)
+            score = float(np.percentile(dist, 95)) / diameter
+            self.get_logger().info(
+                f"Symmetry check: 180deg about {np.round(axis, 3)} -> "
+                f"residual {score:.4f} of diameter"
+                f"{'  [SYMMETRY]' if score < self.symmetry_tol else ''}")
+            if score < self.symmetry_tol:
+                to_c = np.eye(4)
+                to_c[:3, 3] = center
+                from_c = np.eye(4)
+                from_c[:3, 3] = -center
+                tf = np.eye(4)
+                tf[:3, :3] = rot
+                found.append(to_c @ tf @ from_c)  # symmetry about the centroid
+        self.get_logger().info(f"Usable symmetries found: {len(found)}")
+        return found
+
+    def canonicalize_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Return the representation of `pose` whose canonical axis points along
+        the table normal, if a mesh symmetry provides one.
+
+        The result is written back into FoundationPose's own state as well:
+        pose_last @ S renders exactly the same image (S maps the mesh onto
+        itself), so the tracker keeps running on the canonical representation
+        instead of drifting back to the other one next frame."""
+        self.canon_applied = False
+        if (self.canonical_axis is None or self.plane_n is None
+                or not self.symmetry_tfs):
+            return pose
+
+        if float(np.dot(pose[:3, :3] @ self.canonical_axis,
+                        self.plane_n)) >= 0.0:
+            return pose  # already the representation we want
+
+        for tf in self.symmetry_tfs:
+            candidate = pose @ tf
+            if float(np.dot(candidate[:3, :3] @ self.canonical_axis,
+                            self.plane_n)) > 0.0:
+                pose_last = self.FPModel.pose_last
+                if pose_last is not None:
+                    updated = pose_last.detach().cpu().numpy().reshape(4, 4) @ tf
+                    self.FPModel.pose_last = torch.as_tensor(
+                        updated, dtype=pose_last.dtype, device=pose_last.device)
+                self.canon_applied = True
+                return candidate
+
+        # No symmetry fixes it -> a real flip. Leave it for the plane criterion.
+        return pose
+
     # ---------- table-plane constraint ----------
 
-    def _init_plane_reference(self, depth, mask, cam_K, pose):
-        """Fit the table plane by RANSAC on the scene point cloud, then record
-        what "at rest" looks like for this object: how high its lowest vertex
-        sits, and which object-frame axis points along the table normal. Later
-        frames are measured against these references, so a small constant bias
-        in the mesh or the depth image cannot by itself raise a violation."""
+    def _fit_table_plane(self, depth, mask, cam_K):
+        """Fit the table plane by RANSAC on the scene point cloud, excluding the
+        object itself."""
         try:
             valid = depth > 0.001
             if mask is not None and mask.shape == depth.shape:
@@ -863,21 +996,25 @@ class FoundationPoseROS2(Node):
                 n, d = -n, -d
 
             self.plane_n, self.plane_d = n, d
-            # Object-frame direction that currently points along the normal.
-            # Defined this way, tilt is 0 at registration for any mesh, so no
-            # assumption about which axis is "up" is needed.
-            self.plane_u_ref = pose[:3, :3].T @ n
-            self.plane_rest_offset = 0.0
-            metrics = self.plane_metrics(pose)
-            if metrics is not None:
-                self.plane_rest_offset = metrics[0]
-
             self.get_logger().info(
                 f"Table plane fit: normal={np.round(n, 3)}, "
-                f"{len(inliers)}/{len(pts)} inliers, "
-                f"rest offset={self.plane_rest_offset * 1000:.1f} mm")
+                f"{len(inliers)}/{len(pts)} inliers")
         except Exception as e:  # never let plane setup break registration
             self.get_logger().warn(f"Plane fit failed: {e}")
+
+    def _capture_rest_reference(self, pose):
+        """Record what "at rest" looks like: which object-frame axis points
+        along the table normal, and the resting height. Defining the reference
+        from the pose itself means tilt reads 0 at registration for any mesh --
+        no assumption about which axis is "up" -- and a constant bias in the
+        mesh or depth image cannot by itself raise a violation."""
+        self.plane_u_ref = pose[:3, :3].T @ self.plane_n
+        self.plane_rest_offset = 0.0
+        metrics = self.plane_metrics(pose)
+        if metrics is not None:
+            self.plane_rest_offset = metrics[0]
+        self.get_logger().info(
+            f"Rest reference captured: offset={self.plane_rest_offset*1000:.1f} mm")
 
     def plane_metrics(self, pose: np.ndarray):
         """Return (float_height_m, tilt_deg), or None if the plane is not known.
