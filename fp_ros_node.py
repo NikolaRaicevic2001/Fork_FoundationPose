@@ -7,6 +7,7 @@ and publishes the object pose as PoseStamped on /object_pose.
 """
 
 import csv
+import logging
 import os
 import time
 from datetime import datetime
@@ -43,7 +44,15 @@ class FoundationPoseROS2(Node):
     def __init__(self):
         super().__init__("fp_node")
 
-        set_logging_format()
+        # FoundationPose's internals log ~23 INFO lines per tracked frame via the
+        # stdlib logger (estimater, predict_pose_refine, make_crop_data_batch).
+        # The cost is negligible (~0.09 ms/frame), but the flood buries the lines
+        # that matter -- resets, stale-mask warnings, empty masks. Default to
+        # WARNING and put the firehose behind -p verbose:=true.
+        self.declare_parameter("verbose", False)
+        self.verbose = self.get_parameter(
+            "verbose").get_parameter_value().bool_value
+        set_logging_format(logging.INFO if self.verbose else logging.WARNING)
         set_seed(0)
 
         # State variables
@@ -381,7 +390,9 @@ class FoundationPoseROS2(Node):
                                       K=cam_K,
                                       iteration=self.track_refine_iter)
         elapsed_ms = (time.time() - t0) * 1000
-        self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
+        # Once a second is enough to watch the rate; per-frame is just noise.
+        self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms",
+                               throttle_duration_sec=1.0)
 
         # Measure the plane criterion on the RAW pose, before any correction:
         # in correct mode the correction would otherwise erase the very signal
