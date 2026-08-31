@@ -109,6 +109,26 @@ class FoundationPoseROS2(Node):
         # object is heavily occluded => hold, never reset on this frame.
         self.depth_residual_heavy_occ_frac = 0.6
 
+        # Mask IoU vote: FP's rendered silhouette vs SAM2's mask. Catches a
+        # pose that is roughly the right distance away but the wrong shape
+        # entirely (e.g. locked onto the robot arm instead of the object) --
+        # a failure depth residual alone can miss if the arm sits at a
+        # similar depth. `measure_all_criteria` already computed this exact
+        # number for telemetry; this just lets it vote too.
+        # Threshold is deliberately lenient: the reference implementation
+        # this fork is built on uses 0.1-0.2 for the same style of check
+        # (near-total mismatch only) -- SAM2's mask and FP's rendered
+        # silhouette disagree at the boundary even when both are correct
+        # (segmentation noise, the pusher stick's own occlusion), so a
+        # naive-sounding "50%" would fire on healthy tracking. Toggle at
+        # launch with -p use_iou_reset:=false.
+        self.declare_parameter("use_iou_reset", True)
+        self.use_iou_reset = self.get_parameter(
+            "use_iou_reset").get_parameter_value().bool_value
+        self.declare_parameter("iou_reset_thresh", 0.2)
+        self.iou_reset_thresh = self.get_parameter(
+            "iou_reset_thresh").get_parameter_value().double_value
+
         # ---- Table-plane constraint --------------------------------------
         # Pushing happens on a table, so the object rests on a known plane. That
         # removes exactly the freedoms tracking drifts into when occlusion makes
@@ -191,6 +211,29 @@ class FoundationPoseROS2(Node):
         self.first_est_refine_iter = 5  # Higher quality for first registration
         self.est_refine_iter = 1  # Fast re-init when reset triggered
         self.track_refine_iter = 2  # Per-frame tracking
+
+        # ---- Published-pose smoothing (EMA) ------------------------------
+        # Purely a publish-time filter: /object_pose is smoothed, but nothing
+        # feeds back into FPModel.pose_last (unlike canonicalize_pose /
+        # apply_plane_correction, which deliberately DO write back). Reasons:
+        # (1) a discrete symmetry flip is not the kind of thing smoothing
+        # should blend across -- canonicalize_pose already runs first, so by
+        # the time this sees a pose it should already be in the consistent
+        # representation; (2) seeding the tracker's own next-frame guess with
+        # a lagged pose risks making FAST motion tracking worse, trading a
+        # jitter fix for a drift regression. Every reset-vote/debug-viz/CSV
+        # log upstream of this still sees the raw pose -- only the published
+        # topic (and the on-screen visualize box) are smoothed.
+        # Window is exposed the way it is usually talked about ("EMA over the
+        # last N frames") rather than as a raw alpha; alpha = 2/(N+1) is the
+        # standard N-period EMA correspondence. N <= 1 disables smoothing.
+        self.declare_parameter("pose_ema_window", 3)
+        self.pose_ema_window = self.get_parameter(
+            "pose_ema_window").get_parameter_value().integer_value
+        self.pose_ema_alpha = (2.0 / (self.pose_ema_window + 1)
+                               if self.pose_ema_window > 1 else 1.0)
+        self.pose_ema_pos = None    # (3,) running mean, world/camera frame
+        self.pose_ema_quat = None   # (4,) xyzw, running mean then renormalised
 
         # FoundationPose library's internal debug level (passed to the model below).
         # Only >= 2 does anything: it dumps point clouds / refiner-vis images to disk,
@@ -397,6 +440,8 @@ class FoundationPoseROS2(Node):
         self.is_object_registered = True
         self.first = False
         self.pose_last_prev = None  # reset CV-prior history after re-registration
+        self.pose_ema_pos = None  # reset publish-time smoothing too -- a new
+        self.pose_ema_quat = None  # registration must not blend against the old one
         if self.log_csv:
             self._log_row(t_sec=round(time.time() - self.t_start, 4),
                           frame=self.frame_idx,
@@ -467,11 +512,20 @@ class FoundationPoseROS2(Node):
         did_reset = self.check_auto_reset(pose, cam_K, depth_obs,
                                           rendered_depth)
 
+        # Smoothing only runs for a frame that will actually publish -- a
+        # reset frame must not update the EMA state (see apply_pose_ema's own
+        # reasoning). Computed here, before logging, so the CSV can show
+        # raw-vs-smoothed side by side instead of only ever the raw pose.
+        pose_smoothed = None if did_reset else self.apply_pose_ema(pose)
+
         if self.log_csv:
             crit = self.measure_all_criteria(pose, cam_K, depth_obs,
                                              rendered_depth)
             trans = pose[:3, 3]
             quat = R.from_matrix(pose[:3, :3]).as_quat()  # xyzw
+            if pose_smoothed is not None:
+                trans_s = pose_smoothed[:3, 3]
+                quat_s = R.from_matrix(pose_smoothed[:3, :3]).as_quat()
             self._log_row(
                 t_sec=round(time.time() - self.t_start, 4),
                 frame=self.frame_idx,
@@ -484,6 +538,17 @@ class FoundationPoseROS2(Node):
                 qy=round(float(quat[1]), 6),
                 qz=round(float(quat[2]), 6),
                 qw=round(float(quat[3]), 6),
+                # Published (post-EMA) pose -- blank on a reset frame, since
+                # nothing gets published for one. Compare against tx/ty/tz/
+                # qx/qy/qz/qw above to see exactly how much smoothing moved
+                # this frame, rather than inferring it from the overlay.
+                tx_pub=None if pose_smoothed is None else round(float(trans_s[0]), 5),
+                ty_pub=None if pose_smoothed is None else round(float(trans_s[1]), 5),
+                tz_pub=None if pose_smoothed is None else round(float(trans_s[2]), 5),
+                qx_pub=None if pose_smoothed is None else round(float(quat_s[0]), 6),
+                qy_pub=None if pose_smoothed is None else round(float(quat_s[1]), 6),
+                qz_pub=None if pose_smoothed is None else round(float(quat_s[2]), 6),
+                qw_pub=None if pose_smoothed is None else round(float(quat_s[3]), 6),
                 plane_float_m=None if plane_pre is None else round(
                     plane_pre[0], 5),
                 plane_tilt_deg=None if plane_pre is None else round(
@@ -504,6 +569,11 @@ class FoundationPoseROS2(Node):
             return  # Abort publishing this frame and re-register next frame
 
         self.update_cv_prior_history()
+        # Smoothing is publish-time only -- every check above (reset votes,
+        # debug viz, CSV log's raw tx/ty/tz/...) already saw the raw `pose`,
+        # on purpose. Reuse the value already computed above rather than
+        # calling apply_pose_ema (and updating its state) a second time.
+        pose = pose_smoothed
         self.publish_pose(pose)
 
         if self.visualize:
@@ -641,6 +711,43 @@ class FoundationPoseROS2(Node):
             return
         self.pose_last_prev = pose_last.detach().cpu().numpy().reshape(4, 4)
 
+    # ---------- publish-time smoothing ----------
+
+    def apply_pose_ema(self, pose: np.ndarray) -> np.ndarray:
+        """Smooth the pose that actually gets published, over the last
+        `pose_ema_window` frames. See this class's own __init__ comment for
+        why this never writes back into FPModel.pose_last.
+
+        Quaternion averaging here is the standard small-angle approximation
+        (flip to the same hemisphere, blend linearly, renormalise) -- exact
+        for identical quaternions, a good approximation for the few-degree
+        jitter this is meant to smooth, not a real fix for a discrete flip
+        (canonicalize_pose already runs first, so this should never see one)."""
+        if self.pose_ema_window <= 1:
+            return pose
+
+        pos = pose[:3, 3]
+        quat = R.from_matrix(pose[:3, :3]).as_quat()  # xyzw
+
+        if self.pose_ema_pos is None:
+            self.pose_ema_pos = pos.copy()
+            self.pose_ema_quat = quat.copy()
+        else:
+            a = self.pose_ema_alpha
+            self.pose_ema_pos = a * pos + (1.0 - a) * self.pose_ema_pos
+            # Quaternion double-cover: q and -q are the same rotation, but
+            # blend to a near-zero vector if their signs disagree.
+            if np.dot(quat, self.pose_ema_quat) < 0.0:
+                quat = -quat
+            blended = a * quat + (1.0 - a) * self.pose_ema_quat
+            norm = np.linalg.norm(blended)
+            self.pose_ema_quat = blended / norm if norm > 1e-9 else quat
+
+        smoothed = np.eye(4)
+        smoothed[:3, :3] = R.from_quat(self.pose_ema_quat).as_matrix()
+        smoothed[:3, 3] = self.pose_ema_pos
+        return smoothed
+
     # ---------- auto-reset ----------
 
     def check_auto_reset(self,
@@ -692,17 +799,37 @@ class FoundationPoseROS2(Node):
 
         return float(np.hypot(mask_u - fp_u, mask_v - fp_v))
 
+    def _mask_iou(self, rendered_depth, mask_shape):
+        """IoU (float) between FP's rendered silhouette and the current SAM2
+        mask, or None if either is unavailable/shape-mismatched. Same
+        computation `measure_all_criteria` already logs for telemetry --
+        this is the one place it also gets to vote."""
+        if (rendered_depth is None or self.latest_mask is None
+                or mask_shape is None or self.latest_mask.shape != mask_shape):
+            return None
+        sil = rendered_depth > 0
+        mask_bool = self.latest_mask > 0
+        union = int(np.logical_or(sil, mask_bool).sum())
+        if union == 0:
+            return None
+        inter = int(np.logical_and(sil, mask_bool).sum())
+        return inter / union
+
     def _check_reset_depth_residual(self, pose: np.ndarray, cam_K: np.ndarray,
                                     rendered_depth, observed_depth) -> bool:
-        """Combined reset: depth residual (rotation-sensitive) OR centroid
-        distance (gross divergence safety net). Resets when either votes drift
-        for `auto_reset_patience` frames.
+        """Combined reset: depth residual (rotation-sensitive), mask IoU
+        (shape-sensitive), OR centroid distance (gross divergence safety net).
+        Resets when any votes drift for `auto_reset_patience` frames.
 
-        The occlusion guard only silences the DEPTH vote (a briefly hidden but
-        correct pose has high residual / is mostly occluded). The centroid net
-        stays active so a lost object that drifted away -- which makes the depth
-        residual read n/a -- is still caught. Occlusion is only trusted when the
-        centroid agrees the object is roughly where FP thinks it is."""
+        The occlusion guard silences the DEPTH and IoU votes together (a
+        briefly hidden but correct pose reads high residual / low IoU purely
+        from the missing pixels, same failure mode for both -- SAM2's mask
+        only covers what's visible, while FP's rendered silhouette assumes the
+        whole object is there). The centroid net stays active regardless, so a
+        lost object that drifted away -- which makes both silhouette-based
+        votes read n/a or occluded -- is still caught. Occlusion is only
+        trusted when the centroid agrees the object is roughly where FP thinks
+        it is."""
         drift_vote = False
         reasons = []
 
@@ -714,21 +841,35 @@ class FoundationPoseROS2(Node):
             drift_vote = True
             reasons.append(f"center {cdist:.0f}px")
 
-        # (B) Depth residual -- rotation-sensitive, occlusion-gated.
-        residual = None
+        # (B) Depth residual -- rotation-sensitive. Computed once and shared
+        # with the IoU vote below: both are silhouette-based, so they share
+        # the same occlusion read (IoU has no independent signal of its own).
+        residual, trust_occlusion = None, False
         if rendered_depth is not None and observed_depth is not None:
             residual, n_covis, n_occ = self.compute_depth_residual(
                 rendered_depth, observed_depth)
+            occ_frac = (n_occ / n_covis) if n_covis > 0 else 0.0
+            heavy_occ = occ_frac > self.depth_residual_heavy_occ_frac
+            # Trust "heavy occlusion -> hold" only if the centroid agrees the
+            # object is still in place; otherwise it is loss, not occlusion.
+            trust_occlusion = heavy_occ and not centroid_far
             if residual is not None:
-                occ_frac = n_occ / max(1, n_covis)
-                # Trust "heavy occlusion -> hold" only if the centroid agrees the
-                # object is still in place; otherwise it is loss, not occlusion.
-                heavy_occ = occ_frac > self.depth_residual_heavy_occ_frac
-                if heavy_occ and not centroid_far:
+                if trust_occlusion:
                     pass  # genuinely occluded, do not vote from depth
                 elif residual > self.depth_residual_thresh_m:
                     drift_vote = True
                     reasons.append(f"depth {residual*1000:.0f}mm")
+
+        # (C) Mask IoU -- shape-sensitive, catches a pose that is the right
+        # distance away but the wrong silhouette (e.g. tracking the robot arm
+        # instead of the object -- depth residual alone can miss this if the
+        # arm happens to sit at a similar depth).
+        if self.use_iou_reset and not trust_occlusion:
+            mask_shape = observed_depth.shape if observed_depth is not None else None
+            iou = self._mask_iou(rendered_depth, mask_shape)
+            if iou is not None and iou < self.iou_reset_thresh:
+                drift_vote = True
+                reasons.append(f"IoU {iou:.2f}")
 
         if drift_vote:
             self.drift_counter += 1
@@ -778,8 +919,13 @@ class FoundationPoseROS2(Node):
 
     LOG_COLUMNS = [
         "t_sec", "frame", "state", "track_ms",
-        # published pose
+        # raw tracked pose -- everything else in this row (reset votes,
+        # canon, plane_*) was measured against THIS, not the smoothed one
         "tx", "ty", "tz", "qx", "qy", "qz", "qw",
+        # actually published pose, after EMA smoothing (pose_ema_window) --
+        # blank on a reset row, since nothing publishes that frame. Diff
+        # against tx/ty/tz/qx/qy/qz/qw above to see what smoothing changed
+        "tx_pub", "ty_pub", "tz_pub", "qx_pub", "qy_pub", "qz_pub", "qw_pub",
         # table-plane criterion (measured BEFORE any correction)
         "plane_float_m", "plane_tilt_deg",
         # correction actually applied this frame (correct mode only)
