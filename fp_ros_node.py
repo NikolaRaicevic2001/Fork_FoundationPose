@@ -6,8 +6,10 @@ runs FoundationPose estimation/tracking,
 and publishes the object pose as PoseStamped on /object_pose.
 """
 
+import csv
 import os
 import time
+from datetime import datetime
 import numpy as np
 import cv2
 import torch
@@ -168,6 +170,28 @@ class FoundationPoseROS2(Node):
         self.debug_viz = self.get_parameter(
             "debug_viz").get_parameter_value().bool_value
 
+        # ---- Per-frame CSV telemetry -------------------------------------
+        # EVERY criterion is measured every frame and written out, no matter
+        # which one is actually allowed to act. That is the point: thresholds
+        # can then be chosen offline from a recorded run ("if tilt > 15 deg had
+        # tripped a reset, when would it have fired?") without putting the robot
+        # back on the table for each candidate value.
+        # Enable with -p log_csv:=true
+        self.declare_parameter("log_csv", False)
+        self.log_csv = self.get_parameter(
+            "log_csv").get_parameter_value().bool_value
+        self.declare_parameter("log_dir", f"{code_dir}/logs")
+        self.log_dir = self.get_parameter(
+            "log_dir").get_parameter_value().string_value
+        self.log_file = None
+        self.log_writer = None
+        self.log_rows = 0
+        self.frame_idx = 0
+        self.t_start = time.time()
+        self.last_reset_reason = ""
+        if self.log_csv:
+            self._open_log()
+
         # Processing lock to prevent overlapping timer calls
         self.is_processing = False
 
@@ -327,6 +351,12 @@ class FoundationPoseROS2(Node):
         self.is_object_registered = True
         self.first = False
         self.pose_last_prev = None  # reset CV-prior history after re-registration
+        if self.log_csv:
+            self._log_row(t_sec=round(time.time() - self.t_start, 4),
+                          frame=self.frame_idx,
+                          state="register",
+                          track_ms=round(elapsed_ms, 2))
+            self.frame_idx += 1
         self.plane_violation_counter = 0
         # Fit the table once, from the first (highest-quality) registration.
         # Later re-registrations reuse it: the camera and table do not move, and
@@ -353,16 +383,22 @@ class FoundationPoseROS2(Node):
         elapsed_ms = (time.time() - t0) * 1000
         self.get_logger().info(f"Tracking done in {elapsed_ms:.1f} ms")
 
+        # Measure the plane criterion on the RAW pose, before any correction:
+        # in correct mode the correction would otherwise erase the very signal
+        # the log is meant to capture.
+        plane_pre = self.plane_metrics(pose)
+
         # Snap the pose back onto the table before anything downstream sees it.
         if self.plane_mode == "correct":
             pose = self.apply_plane_correction(pose)
+        plane_post = self.plane_metrics(pose)
 
-        # Render the FP depth once and reuse it for both debug viz and the
-        # depth-residual reset (avoids rendering the mesh twice per frame).
+        # Render the FP depth once and reuse it for the debug viz, the
+        # depth-residual reset, and telemetry (never render twice per frame).
         H, W = depth_obs.shape
         rendered_depth = None
-        need_render = self.debug_viz or (self.use_auto_reset and
-                                         self.use_depth_residual_reset)
+        need_render = self.debug_viz or self.log_csv or (
+            self.use_auto_reset and self.use_depth_residual_reset)
         if need_render:
             rendered_depth = self.render_fp_depth(pose, cam_K, H, W)
 
@@ -371,7 +407,42 @@ class FoundationPoseROS2(Node):
         if self.debug_viz:
             self.publish_debug_viz(rgb, pose, cam_K, depth_obs, rendered_depth)
 
-        if self.check_auto_reset(pose, cam_K, depth_obs, rendered_depth):
+        did_reset = self.check_auto_reset(pose, cam_K, depth_obs,
+                                          rendered_depth)
+
+        if self.log_csv:
+            crit = self.measure_all_criteria(pose, cam_K, depth_obs,
+                                             rendered_depth)
+            trans = pose[:3, 3]
+            quat = R.from_matrix(pose[:3, :3]).as_quat()  # xyzw
+            self._log_row(
+                t_sec=round(time.time() - self.t_start, 4),
+                frame=self.frame_idx,
+                state="track",
+                track_ms=round(elapsed_ms, 2),
+                tx=round(float(trans[0]), 5),
+                ty=round(float(trans[1]), 5),
+                tz=round(float(trans[2]), 5),
+                qx=round(float(quat[0]), 6),
+                qy=round(float(quat[1]), 6),
+                qz=round(float(quat[2]), 6),
+                qw=round(float(quat[3]), 6),
+                plane_float_m=None if plane_pre is None else round(
+                    plane_pre[0], 5),
+                plane_tilt_deg=None if plane_pre is None else round(
+                    plane_pre[1], 2),
+                corr_float_mm=None if (plane_pre is None or plane_post is None)
+                else round((plane_post[0] - plane_pre[0]) * 1000, 2),
+                corr_tilt_deg=None if (plane_pre is None or plane_post is None)
+                else round(plane_post[1] - plane_pre[1], 2),
+                drift_counter=self.drift_counter,
+                plane_counter=self.plane_violation_counter,
+                reset=int(did_reset),
+                reset_reason=self.last_reset_reason,
+                **crit)
+        self.frame_idx += 1
+
+        if did_reset:
             return  # Abort publishing this frame and re-register next frame
 
         self.update_cv_prior_history()
@@ -523,6 +594,8 @@ class FoundationPoseROS2(Node):
         was triggered. Depth-residual mode catches rotation drift that leaves
         the centroid in place; centroid mode is the translation-only fallback."""
 
+        self.last_reset_reason = ""
+
         # Plane violation is checked first, independently of
         # use_auto_reset, so it can be A/B tested on its own.
         if self.check_reset_plane(pose):
@@ -605,6 +678,7 @@ class FoundationPoseROS2(Node):
             self.drift_counter = max(0, self.drift_counter - 1)
 
         if self.drift_counter >= self.auto_reset_patience:
+            self.last_reset_reason = "; ".join(reasons)
             self.get_logger().warn(
                 f"Tracking lost ({', '.join(reasons)}). Auto-reset triggered.")
             self.is_object_registered = False
@@ -632,6 +706,7 @@ class FoundationPoseROS2(Node):
 
         # Trigger reset if patience is exceeded
         if self.drift_counter >= self.auto_reset_patience:
+            self.last_reset_reason = f"center={dist:.0f}px"
             self.get_logger().warn(
                 f"Tracking lost (Center dist: {dist:.1f}px). Auto-reset triggered."
             )
@@ -640,6 +715,95 @@ class FoundationPoseROS2(Node):
             return True
 
         return False
+
+    # ---------- telemetry ----------
+
+    LOG_COLUMNS = [
+        "t_sec", "frame", "state", "track_ms",
+        # published pose
+        "tx", "ty", "tz", "qx", "qy", "qz", "qw",
+        # table-plane criterion (measured BEFORE any correction)
+        "plane_float_m", "plane_tilt_deg",
+        # correction actually applied this frame (correct mode only)
+        "corr_float_mm", "corr_tilt_deg",
+        # centroid criterion
+        "centroid_px",
+        # silhouette-vs-SAM2 criterion
+        "iou", "sil_px", "mask_px", "mask_age_s",
+        # depth-residual criterion
+        "depth_res_m", "n_covisible", "occ_frac",
+        # reset bookkeeping
+        "drift_counter", "plane_counter", "reset", "reset_reason",
+    ]
+
+    def _open_log(self):
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(self.log_dir, f"fp_track_{stamp}.csv")
+            self.log_file = open(path, "w", newline="")
+            self.log_writer = csv.writer(self.log_file)
+            self.log_writer.writerow(self.LOG_COLUMNS)
+            self.log_file.flush()
+            self.get_logger().info(f"Telemetry log: {path}")
+        except Exception as e:
+            self.get_logger().warn(f"Could not open telemetry log: {e}")
+            self.log_writer = None
+
+    def _log_row(self, **kw):
+        """Append one row. Never allowed to disturb tracking."""
+        if self.log_writer is None:
+            return
+        try:
+            self.log_writer.writerow(
+                ["" if kw.get(c) is None else kw.get(c, "")
+                 for c in self.LOG_COLUMNS])
+            self.log_rows += 1
+            if self.log_rows % 20 == 0:  # survive a kill without losing much
+                self.log_file.flush()
+        except Exception as e:
+            self.get_logger().warn(f"Telemetry write failed: {e}",
+                                   throttle_duration_sec=5.0)
+
+    def measure_all_criteria(self, pose, cam_K, observed_depth, rendered_depth):
+        """Evaluate every drift criterion, independent of which one is enabled.
+        Returns a dict of raw measurements -- no thresholds applied here."""
+        out = {
+            "centroid_px": None, "iou": None, "sil_px": None,
+            "mask_px": None, "mask_age_s": None,
+            "depth_res_m": None, "n_covisible": None, "occ_frac": None,
+        }
+
+        cdist = self._centroid_distance(pose, cam_K)
+        if cdist is not None:
+            out["centroid_px"] = round(cdist, 2)
+
+        if self.latest_mask is not None:
+            mask_bool = self.latest_mask > 0
+            out["mask_px"] = int(mask_bool.sum())
+            if self.latest_mask_stamp is not None:
+                age = (self.get_clock().now() -
+                       self.latest_mask_stamp).nanoseconds * 1e-9
+                out["mask_age_s"] = round(age, 3)
+
+        if rendered_depth is not None:
+            sil = rendered_depth > 0
+            out["sil_px"] = int(sil.sum())
+            if (self.latest_mask is not None
+                    and self.latest_mask.shape == sil.shape):
+                mask_bool = self.latest_mask > 0
+                union = int(np.logical_or(sil, mask_bool).sum())
+                if union > 0:
+                    inter = int(np.logical_and(sil, mask_bool).sum())
+                    out["iou"] = round(inter / union, 4)
+            if observed_depth is not None:
+                res, n_covis, n_occ = self.compute_depth_residual(
+                    rendered_depth, observed_depth)
+                out["n_covisible"] = n_covis
+                out["occ_frac"] = round(n_occ / max(1, n_covis), 4)
+                if res is not None:
+                    out["depth_res_m"] = round(res, 5)
+        return out
 
     # ---------- table-plane constraint ----------
 
@@ -744,6 +908,8 @@ class FoundationPoseROS2(Node):
                 0, self.plane_violation_counter - 1)
 
         if self.plane_violation_counter >= self.plane_patience:
+            self.last_reset_reason = (f"plane float={float_h * 1000:+.0f}mm "
+                                      f"tilt={tilt:.0f}deg")
             self.get_logger().warn(
                 f"Off the table (float {float_h * 1000:+.0f}mm, "
                 f"tilt {tilt:.0f}deg). Auto-reset triggered.")
