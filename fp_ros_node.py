@@ -182,17 +182,33 @@ class FoundationPoseROS2(Node):
         # consumer that reads the axis literally -- the downstream planner --
         # sees the object flip for no reason.
         #
-        # So: pick the representation whose named object axis points along the
-        # table normal, using a symmetry of the mesh itself. Because the mesh is
-        # symmetric under that transform, nothing is lost. If NO symmetry can
-        # fix the direction, the pose is left untouched: that is a genuine
-        # flip, and the plane tilt criterion should report it rather than have
-        # it silently rewritten.
-        # Set e.g. -p canonical_up_axis:=-z  (empty string disables it).
-        self.declare_parameter("canonical_up_axis", "")
-        axis_str = self.get_parameter(
-            "canonical_up_axis").get_parameter_value().string_value.strip()
-        self.canonical_axis = self._parse_axis(axis_str) if axis_str else None
+        # So: keep every frame in the SAME representation the rest reference was
+        # captured in, by picking whichever symmetry of the mesh minimises the
+        # plane tilt. Because the mesh is symmetric under that transform nothing
+        # is lost, and if no symmetry improves the tilt the pose is left alone --
+        # that is a genuine flip, which the tilt criterion should report rather
+        # than have silently rewritten.
+        #
+        # Deliberately NOT parameterised by naming an axis. An earlier version
+        # asked for one ("-z") and picking the wrong one was catastrophic: the
+        # named axis lay in the table plane, so its sign test sat on zero and
+        # chattered every other frame, flipping the published pose 180 deg and
+        # tripping a reset storm. Minimising tilt has no axis to misname and
+        # agrees with the reset criterion by construction.
+        self.declare_parameter("canonicalize", False)
+        self.canonicalize = self.get_parameter(
+            "canonicalize").get_parameter_value().bool_value
+        # Which of the two representations the downstream consumer wants is a
+        # convention, not geometry, so it stays a human decision -- but only a
+        # single boolean, applied once at registration.
+        self.declare_parameter("canonical_flip", False)
+        self.canonical_flip = self.get_parameter(
+            "canonical_flip").get_parameter_value().bool_value
+        # Only switch representation when the alternative is better by this
+        # margin, so a pose sitting near the midpoint cannot chatter.
+        self.declare_parameter("canonical_switch_margin_deg", 20.0)
+        self.canonical_switch_margin_deg = self.get_parameter(
+            "canonical_switch_margin_deg").get_parameter_value().double_value
         self.declare_parameter("symmetry_tol", 0.02)
         self.symmetry_tol = self.get_parameter(
             "symmetry_tol").get_parameter_value().double_value
@@ -299,7 +315,7 @@ class FoundationPoseROS2(Node):
             mesh_v = mesh_v[np.random.default_rng(0).choice(
                 len(mesh_v), 5000, replace=False)]
         self.plane_pts = mesh_v
-        if self.canonical_axis is not None:
+        if self.canonicalize:
             self.symmetry_tfs = self._detect_symmetries()
 
         # FoundationPose model init
@@ -455,11 +471,18 @@ class FoundationPoseROS2(Node):
         # that error into the constraint.
         if self.plane_mode != "off" and self.plane_n is None:
             self._fit_table_plane(depth, mask, cam_K)
-        # Canonicalise BEFORE capturing the rest reference, so the reference is
-        # recorded in the same representation every later frame is compared in.
-        pose = self.canonicalize_pose(pose)
         if self.plane_n is not None and self.plane_u_ref is None:
+            # One-time convention choice, applied before the reference is
+            # captured so every later frame is compared in that representation.
+            if self.canonicalize and self.canonical_flip and self.symmetry_tfs:
+                pose = self._apply_symmetry(pose, self.symmetry_tfs[0])
+                self.get_logger().info(
+                    "canonical_flip: registered in the flipped representation")
             self._capture_rest_reference(pose)
+            self._report_axis_alignment(pose)
+        else:
+            # Later re-registrations: pull back to the established convention.
+            pose = self.canonicalize_pose(pose)
 
     def _track(self):
         """Frame-to-frame tracking."""
@@ -1011,18 +1034,6 @@ class FoundationPoseROS2(Node):
 
     # ---------- symmetry canonicalisation ----------
 
-    @staticmethod
-    def _parse_axis(text: str) -> np.ndarray:
-        """Parse '+z' / '-z' / 'x' ... into a unit vector in the object frame."""
-        text = text.lower().replace(" ", "")
-        sign = -1.0 if text.startswith("-") else 1.0
-        letter = text.lstrip("+-")
-        if letter not in ("x", "y", "z"):
-            raise ValueError(f"canonical_up_axis must be +/-x|y|z, got: {text}")
-        vec = np.zeros(3)
-        vec["xyz".index(letter)] = sign
-        return vec
-
     def _detect_symmetries(self):
         """Find 180 deg rotations that map the mesh onto itself, tested about the
         oriented-bounding-box axes (the object's own principal directions, which
@@ -1066,36 +1077,62 @@ class FoundationPoseROS2(Node):
         self.get_logger().info(f"Usable symmetries found: {len(found)}")
         return found
 
-    def canonicalize_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Return the representation of `pose` whose canonical axis points along
-        the table normal, if a mesh symmetry provides one.
+    def _apply_symmetry(self, pose: np.ndarray, tf: np.ndarray) -> np.ndarray:
+        """Re-express `pose` through a mesh self-symmetry, updating
+        FoundationPose's own state too. `pose_last @ S` renders exactly the same
+        image (S maps the mesh onto itself), so the tracker carries on in the new
+        representation instead of drifting back to the old one next frame."""
+        pose_last = self.FPModel.pose_last
+        if pose_last is not None:
+            updated = pose_last.detach().cpu().numpy().reshape(4, 4) @ tf
+            self.FPModel.pose_last = torch.as_tensor(updated,
+                                                     dtype=pose_last.dtype,
+                                                     device=pose_last.device)
+        return pose @ tf
 
-        The result is written back into FoundationPose's own state as well:
-        pose_last @ S renders exactly the same image (S maps the mesh onto
-        itself), so the tracker keeps running on the canonical representation
-        instead of drifting back to the other one next frame."""
+    def _report_axis_alignment(self, pose: np.ndarray):
+        """Log how each object axis lines up with the table normal at rest.
+        Purely diagnostic, but it is the number that explains which axis is
+        physically 'up' for this mesh -- worth having in the log rather than
+        inferred by hand."""
+        if self.plane_n is None:
+            return
+        axes = self.to_origin[:3, :3]
+        for i in range(3):
+            axis = axes[i] / np.linalg.norm(axes[i])
+            align = float(np.dot(pose[:3, :3] @ axis, self.plane_n))
+            self.get_logger().info(
+                f"Axis alignment at rest: object axis {np.round(axis, 3)} "
+                f"-> {align:+.3f} along table normal")
+
+    def canonicalize_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Keep the pose in the representation the rest reference was captured
+        in, by choosing the mesh symmetry that minimises plane tilt.
+
+        Minimising the very quantity the reset criterion measures is what makes
+        this safe: canonicalisation can never "fix" a pose into a state the tilt
+        check then flags, which is exactly how the earlier named-axis version
+        produced frames that were canonicalised and 176 deg tilted at once."""
         self.canon_applied = False
-        if (self.canonical_axis is None or self.plane_n is None
-                or not self.symmetry_tfs):
+        if (not self.canonicalize or self.plane_n is None
+                or self.plane_u_ref is None or not self.symmetry_tfs):
             return pose
 
-        if float(np.dot(pose[:3, :3] @ self.canonical_axis,
-                        self.plane_n)) >= 0.0:
-            return pose  # already the representation we want
+        metrics = self.plane_metrics(pose)
+        if metrics is None:
+            return pose
+        best_tilt = metrics[1]
 
         for tf in self.symmetry_tfs:
             candidate = pose @ tf
-            if float(np.dot(candidate[:3, :3] @ self.canonical_axis,
-                            self.plane_n)) > 0.0:
-                pose_last = self.FPModel.pose_last
-                if pose_last is not None:
-                    updated = pose_last.detach().cpu().numpy().reshape(4, 4) @ tf
-                    self.FPModel.pose_last = torch.as_tensor(
-                        updated, dtype=pose_last.dtype, device=pose_last.device)
+            cand_metrics = self.plane_metrics(candidate)
+            if cand_metrics is None:
+                continue
+            if cand_metrics[1] < best_tilt - self.canonical_switch_margin_deg:
+                pose = self._apply_symmetry(pose, tf)
+                best_tilt = cand_metrics[1]
                 self.canon_applied = True
-                return candidate
 
-        # No symmetry fixes it -> a real flip. Leave it for the plane criterion.
         return pose
 
     # ---------- table-plane constraint ----------
