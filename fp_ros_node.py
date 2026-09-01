@@ -472,17 +472,12 @@ class FoundationPoseROS2(Node):
         if self.plane_mode != "off" and self.plane_n is None:
             self._fit_table_plane(depth, mask, cam_K)
         if self.plane_n is not None and self.plane_u_ref is None:
-            # One-time convention choice, applied before the reference is
-            # captured so every later frame is compared in that representation.
-            if self.canonicalize and self.canonical_flip and self.symmetry_tfs:
-                pose = self._apply_symmetry(pose, self.symmetry_tfs[0])
-                self.get_logger().info(
-                    "canonical_flip: registered in the flipped representation")
             self._capture_rest_reference(pose)
             self._report_axis_alignment(pose)
-        else:
-            # Later re-registrations: pull back to the established convention.
-            pose = self.canonicalize_pose(pose)
+        # Snap to the convention immediately. With a mesh-anchored reference the
+        # very first registration can already be the wrong representation, so
+        # this must run then too -- not only on re-registrations.
+        pose = self.canonicalize_pose(pose)
 
     def _track(self):
         """Frame-to-frame tracking."""
@@ -1191,13 +1186,44 @@ class FoundationPoseROS2(Node):
         from the pose itself means tilt reads 0 at registration for any mesh --
         no assumption about which axis is "up" -- and a constant bias in the
         mesh or depth image cannot by itself raise a violation."""
-        self.plane_u_ref = pose[:3, :3].T @ self.plane_n
+        # Where this reference comes from decides whether the published pose is
+        # reproducible between runs. Deriving it from the registration pose
+        # (R_reg^T @ n) makes tilt read 0 at registration, which is convenient --
+        # but registration is exactly the coin flip we are trying to remove, so
+        # each run then adopts whichever representation it happened to draw and
+        # the published axis flips at random from run to run.
+        #
+        # With canonicalisation on, anchor it to the MESH instead: the
+        # bounding-box axis most aligned with the table normal, keeping the sign
+        # the mesh file gives it. The axis choice is identical in either
+        # representation (a symmetry maps each axis to plus or minus itself, so
+        # the alignment magnitudes are unchanged) and the sign never consults the
+        # pose. Every run then converges on the same representation.
+        self.plane_u_ref = None
+        if self.canonicalize and self.symmetry_tfs:
+            axes = self.to_origin[:3, :3]
+            aligns = []
+            for i in range(3):
+                axis = axes[i] / np.linalg.norm(axes[i])
+                aligns.append(
+                    abs(float(np.dot(pose[:3, :3] @ axis, self.plane_n))))
+            best = int(np.argmax(aligns))
+            base = axes[best] / np.linalg.norm(axes[best])
+            self.plane_u_ref = -base if self.canonical_flip else base
+            self.get_logger().info(
+                f"Rest reference anchored to mesh axis {np.round(base, 3)} "
+                f"(alignments {np.round(aligns, 3)}, flip={self.canonical_flip})")
+        else:
+            self.plane_u_ref = pose[:3, :3].T @ self.plane_n
+
         self.plane_rest_offset = 0.0
         metrics = self.plane_metrics(pose)
         if metrics is not None:
             self.plane_rest_offset = metrics[0]
-        self.get_logger().info(
-            f"Rest reference captured: offset={self.plane_rest_offset*1000:.1f} mm")
+            self.get_logger().info(
+                f"Rest reference captured: offset="
+                f"{self.plane_rest_offset * 1000:.1f} mm, "
+                f"tilt={metrics[1]:.1f} deg")
 
     def plane_metrics(self, pose: np.ndarray):
         """Return (float_height_m, tilt_deg), or None if the plane is not known.
