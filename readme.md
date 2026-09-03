@@ -135,8 +135,7 @@ python3 fp_ros_node.py --ros-args \
     -p camera:=realsense \
     -p mesh_file:=meshes/T_block/T_block.ply \  # You can replace this with different object meshes in ./meshes    
     -p plane_mode:=detect \
-    -p canonicalize:=true \
-    -p canonical_flip:=false \
+    -p canonicalize:=true -p canonical_flip:=true \
     -p log_csv:=true
 ```
 `self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
