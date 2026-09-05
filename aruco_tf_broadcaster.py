@@ -29,9 +29,13 @@ from tf2_ros import TransformBroadcaster
 from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 
 # The tag sits centered on the box's top face, so the box center is
-# straight down from the tag by half the box height (box_clutter_real.xml:
-# geom size [.., .., 0.0298], i.e. half-height 0.0298m).
-BOX_HALF_HEIGHT_M = 0.0298
+# straight down from the tag by half the box height. Obstacles are the
+# 0.10 x 0.10 x 0.05 m cubes since 2026-09-05 (half-height 0.025 m; the
+# pudding boxes were 0.0596 m tall, 0.0298). Keep in sync with
+# _OBSTACLE_HEIGHT_HALF in oim/worlds/real3d/live_scene.py. Only the
+# planner-unused z changes for a level tag; the x/y of obs_N_center are
+# unaffected unless the box is tilted.
+BOX_HALF_HEIGHT_M = 0.025
 OBSTACLES = ("obs_1", "obs_2", "obs_3")
 
 
