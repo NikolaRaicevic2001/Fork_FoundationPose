@@ -176,10 +176,13 @@ class FoundationPoseROS2(Node):
         self.declare_parameter("plane_fit_radius_m", 0.35)
         self.plane_fit_radius_m = self.get_parameter(
             "plane_fit_radius_m").get_parameter_value().double_value
-        # An object resting on the fitted plane must be within this of it. If it
-        # is not, the fit found some other surface; say so loudly and switch the
-        # plane criterion off rather than emit nonsense heights and tilts.
-        self.declare_parameter("plane_max_rest_offset_m", 0.06)
+        # How far the object's LOWEST point may sit off the fitted plane before
+        # the fit is rejected. Checking the lowest point rather than the centroid
+        # is what makes a single limit work for every object: "resting on it"
+        # means the bottom touches, whereas the centroid sits half the object's
+        # height up -- so a fixed centroid limit would falsely reject anything
+        # tall (a mustard bottle's centroid is 95 mm up, a T-block's only 30 mm).
+        self.declare_parameter("plane_max_rest_offset_m", 0.03)
         self.plane_max_rest_offset_m = self.get_parameter(
             "plane_max_rest_offset_m").get_parameter_value().double_value
         self.declare_parameter("plane_fit_thresh_m", 0.01)
@@ -1259,22 +1262,35 @@ class FoundationPoseROS2(Node):
         self.plane_rest_offset = 0.0
         self.plane_rest_tilt = 0.0
 
+    def _lowest_point_height(self, pose: np.ndarray):
+        """Signed distance from the fitted plane to the object's lowest point."""
+        if self.plane_n is None:
+            return None
+        pts_cam = self.plane_pts @ pose[:3, :3].T + pose[:3, 3]
+        return float((pts_cam @ self.plane_n + self.plane_d).min())
+
     def _capture_rest_offsets(self, pose):
         """Record the resting height and tilt as the zero points, then check the
         object is actually ON the fitted plane. If it is not, the fit found some
         other surface and every later reading would be meaningless, so the plane
-        criterion disables itself instead of firing endless false resets."""
+        criterion disables itself instead of firing endless false resets.
+
+        The two use different points on purpose. Tracking measures the CENTROID,
+        which does not move when the object rotates, keeping height and tilt
+        independent of one another. Validation measures the LOWEST point, since
+        that is what "resting on the plane" physically means -- and it is the
+        only test that holds for a tall object as well as a flat one."""
         metrics = self.plane_metrics(pose)  # raw: both zero points still 0
         if metrics is None:
             return
-        self.plane_rest_offset, self.plane_rest_tilt = metrics
 
-        if abs(self.plane_rest_offset) > self.plane_max_rest_offset_m:
+        bottom = self._lowest_point_height(pose)
+        if bottom is not None and abs(bottom) > self.plane_max_rest_offset_m:
             self.get_logger().error(
-                f"Plane fit rejected: the object sits "
-                f"{self.plane_rest_offset * 1000:.0f} mm off the fitted plane "
-                f"(limit {self.plane_max_rest_offset_m * 1000:.0f} mm). That is "
-                f"not the surface it rests on — most likely a background plane. "
+                f"Plane fit rejected: the object's lowest point sits "
+                f"{bottom * 1000:.0f} mm off the fitted plane (limit "
+                f"{self.plane_max_rest_offset_m * 1000:.0f} mm). That is not the "
+                f"surface it rests on — most likely a background plane. "
                 f"Disabling the plane criterion; try a smaller "
                 f"plane_fit_radius_m.")
             self.plane_n = None
@@ -1282,9 +1298,11 @@ class FoundationPoseROS2(Node):
             self.plane_u_ref = None
             return
 
+        self.plane_rest_offset, self.plane_rest_tilt = metrics
+        bottom_txt = "n/a" if bottom is None else f"{bottom * 1000:.1f} mm"
         self.get_logger().info(
-            f"Rest reference captured: height="
-            f"{self.plane_rest_offset * 1000:.1f} mm, "
+            f"Rest reference captured: centroid height="
+            f"{self.plane_rest_offset * 1000:.1f} mm (bottom {bottom_txt}), "
             f"tilt={self.plane_rest_tilt:.1f} deg "
             f"(both are now the zero point; thresholds apply to deviations)")
 
