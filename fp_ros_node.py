@@ -75,7 +75,12 @@ class FoundationPoseROS2(Node):
         self.use_mask_gating = True
         self.mask_gating_min_pixels = 100  # below this, mask is empty -> skip gating
         self.mask_gating_dilate_px = 15  # grow mask to absorb mask/object lag
-        self.mask_gating_max_staleness_sec = 1.2  # skip gating if mask older (SAM2 ~1Hz)
+        # Skip gating when the mask is older than this. SAM2 currently runs at
+        # 3 Hz (a healthy mask is ~170 ms old), so tripping this means SAM2
+        # stalled or is re-initialising, not that the limit is too tight.
+        self.declare_parameter("mask_gating_max_staleness_sec", 1.2)
+        self.mask_gating_max_staleness_sec = self.get_parameter(
+            "mask_gating_max_staleness_sec").get_parameter_value().double_value
 
         # Auto-reset parameters for spatial drift detection
         self.use_auto_reset = True
@@ -161,6 +166,22 @@ class FoundationPoseROS2(Node):
         self.declare_parameter("plane_patience", 5)
         self.plane_patience = self.get_parameter(
             "plane_patience").get_parameter_value().integer_value
+        # Only fit the plane to points near the object. Fitting the whole view
+        # picks the LARGEST plane, which is a background surface whenever the
+        # tabletop is only part of the frame -- observed once as a fit 598 mm
+        # away from an object that was sitting flat on the table, with a normal
+        # whose vertical component had the wrong sign. Restricting the search to
+        # the object's neighbourhood makes the surface it rests on the only
+        # candidate. 0 disables the restriction (old whole-view behaviour).
+        self.declare_parameter("plane_fit_radius_m", 0.35)
+        self.plane_fit_radius_m = self.get_parameter(
+            "plane_fit_radius_m").get_parameter_value().double_value
+        # An object resting on the fitted plane must be within this of it. If it
+        # is not, the fit found some other surface; say so loudly and switch the
+        # plane criterion off rather than emit nonsense heights and tilts.
+        self.declare_parameter("plane_max_rest_offset_m", 0.06)
+        self.plane_max_rest_offset_m = self.get_parameter(
+            "plane_max_rest_offset_m").get_parameter_value().double_value
         self.declare_parameter("plane_fit_thresh_m", 0.01)
         self.plane_fit_thresh_m = self.get_parameter(
             "plane_fit_thresh_m").get_parameter_value().double_value
@@ -220,7 +241,8 @@ class FoundationPoseROS2(Node):
         self.plane_n = None
         self.plane_d = None
         self.plane_u_ref = None  # object-frame axis that pointed "up" at reg.
-        self.plane_rest_offset = 0.0  # lowest-point distance when at rest
+        self.plane_rest_offset = 0.0  # centroid height when at rest
+        self.plane_rest_tilt = 0.0  # reference-axis tilt when at rest
         self.plane_violation_counter = 0
 
         # Refinement iterations
@@ -470,14 +492,22 @@ class FoundationPoseROS2(Node):
         # re-deriving the reference from a mediocre re-registration would bake
         # that error into the constraint.
         if self.plane_mode != "off" and self.plane_n is None:
-            self._fit_table_plane(depth, mask, cam_K)
-        if self.plane_n is not None and self.plane_u_ref is None:
-            self._capture_rest_reference(pose)
+            self._fit_table_plane(depth, mask, cam_K, pose)
+        first_reference = (self.plane_n is not None
+                           and self.plane_u_ref is None)
+        if first_reference:
+            # Direction first: canonicalisation needs it to evaluate tilt.
+            self._capture_reference_direction(pose)
             self._report_axis_alignment(pose)
         # Snap to the convention immediately. With a mesh-anchored reference the
         # very first registration can already be the wrong representation, so
         # this must run then too -- not only on re-registrations.
         pose = self.canonicalize_pose(pose)
+        if first_reference:
+            # Zero points come last, measured on the pose that will actually be
+            # tracked. Capturing them before canonicalisation would leave the
+            # baseline describing a representation nothing is ever compared in.
+            self._capture_rest_offsets(pose)
 
     def _track(self):
         """Frame-to-frame tracking."""
@@ -1132,9 +1162,9 @@ class FoundationPoseROS2(Node):
 
     # ---------- table-plane constraint ----------
 
-    def _fit_table_plane(self, depth, mask, cam_K):
-        """Fit the table plane by RANSAC on the scene point cloud, excluding the
-        object itself."""
+    def _fit_table_plane(self, depth, mask, cam_K, pose=None):
+        """Fit the surface the object rests on, by RANSAC over the points around
+        it -- the object itself excluded, and the background along with it."""
         try:
             valid = depth > 0.001
             if mask is not None and mask.shape == depth.shape:
@@ -1146,6 +1176,20 @@ class FoundationPoseROS2(Node):
 
             pts = depth2xyzmap(depth, cam_K)[valid].reshape(-1, 3)
             pts = pts[np.isfinite(pts).all(axis=1)]
+
+            # Keep only what is near the object, so the surface it stands on is
+            # the biggest plane in the set rather than competing with the room.
+            if pose is not None and self.plane_fit_radius_m > 0:
+                near = np.linalg.norm(pts - pose[:3, 3],
+                                      axis=1) < self.plane_fit_radius_m
+                if int(near.sum()) >= 500:
+                    pts = pts[near]
+                else:
+                    self.get_logger().warn(
+                        f"Only {int(near.sum())} points within "
+                        f"{self.plane_fit_radius_m:.2f} m of the object — "
+                        f"falling back to the whole view")
+
             if len(pts) < 500:
                 self.get_logger().warn(
                     f"Plane fit skipped: only {len(pts)} scene points")
@@ -1180,26 +1224,23 @@ class FoundationPoseROS2(Node):
         except Exception as e:  # never let plane setup break registration
             self.get_logger().warn(f"Plane fit failed: {e}")
 
-    def _capture_rest_reference(self, pose):
-        """Record what "at rest" looks like: which object-frame axis points
-        along the table normal, and the resting height. Defining the reference
-        from the pose itself means tilt reads 0 at registration for any mesh --
-        no assumption about which axis is "up" -- and a constant bias in the
-        mesh or depth image cannot by itself raise a violation."""
-        # Where this reference comes from decides whether the published pose is
-        # reproducible between runs. Deriving it from the registration pose
-        # (R_reg^T @ n) makes tilt read 0 at registration, which is convenient --
-        # but registration is exactly the coin flip we are trying to remove, so
-        # each run then adopts whichever representation it happened to draw and
-        # the published axis flips at random from run to run.
-        #
-        # With canonicalisation on, anchor it to the MESH instead: the
-        # bounding-box axis most aligned with the table normal, keeping the sign
-        # the mesh file gives it. The axis choice is identical in either
-        # representation (a symmetry maps each axis to plus or minus itself, so
-        # the alignment magnitudes are unchanged) and the sign never consults the
-        # pose. Every run then converges on the same representation.
-        self.plane_u_ref = None
+    def _capture_reference_direction(self, pose):
+        """Choose the object-frame direction that should point along the table
+        normal. Sets no zero points -- those are captured afterwards, once
+        canonicalisation has settled which representation is being tracked.
+
+        Where this direction comes from decides whether the published pose is
+        reproducible between runs. Deriving it from the registration pose
+        (R_reg^T @ n) makes tilt read 0 at registration, which is convenient --
+        but registration is exactly the coin flip we are trying to remove, so
+        each run would adopt whichever representation it happened to draw.
+
+        With canonicalisation on, anchor it to the MESH instead: the
+        bounding-box axis most aligned with the table normal, keeping the sign
+        the mesh file gives it. The axis choice is identical in either
+        representation (a symmetry maps each axis to plus or minus itself, so
+        the alignment magnitudes are unchanged) and the sign never consults the
+        pose. Every run then converges on the same representation."""
         if self.canonicalize and self.symmetry_tfs:
             axes = self.to_origin[:3, :3]
             aligns = []
@@ -1215,15 +1256,37 @@ class FoundationPoseROS2(Node):
                 f"(alignments {np.round(aligns, 3)}, flip={self.canonical_flip})")
         else:
             self.plane_u_ref = pose[:3, :3].T @ self.plane_n
-
         self.plane_rest_offset = 0.0
-        metrics = self.plane_metrics(pose)
-        if metrics is not None:
-            self.plane_rest_offset = metrics[0]
-            self.get_logger().info(
-                f"Rest reference captured: offset="
-                f"{self.plane_rest_offset * 1000:.1f} mm, "
-                f"tilt={metrics[1]:.1f} deg")
+        self.plane_rest_tilt = 0.0
+
+    def _capture_rest_offsets(self, pose):
+        """Record the resting height and tilt as the zero points, then check the
+        object is actually ON the fitted plane. If it is not, the fit found some
+        other surface and every later reading would be meaningless, so the plane
+        criterion disables itself instead of firing endless false resets."""
+        metrics = self.plane_metrics(pose)  # raw: both zero points still 0
+        if metrics is None:
+            return
+        self.plane_rest_offset, self.plane_rest_tilt = metrics
+
+        if abs(self.plane_rest_offset) > self.plane_max_rest_offset_m:
+            self.get_logger().error(
+                f"Plane fit rejected: the object sits "
+                f"{self.plane_rest_offset * 1000:.0f} mm off the fitted plane "
+                f"(limit {self.plane_max_rest_offset_m * 1000:.0f} mm). That is "
+                f"not the surface it rests on — most likely a background plane. "
+                f"Disabling the plane criterion; try a smaller "
+                f"plane_fit_radius_m.")
+            self.plane_n = None
+            self.plane_d = None
+            self.plane_u_ref = None
+            return
+
+        self.get_logger().info(
+            f"Rest reference captured: height="
+            f"{self.plane_rest_offset * 1000:.1f} mm, "
+            f"tilt={self.plane_rest_tilt:.1f} deg "
+            f"(both are now the zero point; thresholds apply to deviations)")
 
     def plane_metrics(self, pose: np.ndarray):
         """Return (float_height_m, tilt_deg), or None if the plane is not known.
@@ -1243,7 +1306,15 @@ class FoundationPoseROS2(Node):
         height = float(centroid @ self.plane_n + self.plane_d)
         up_now = rot @ self.plane_u_ref
         cos = float(np.clip(np.dot(up_now, self.plane_n), -1.0, 1.0))
-        return height - self.plane_rest_offset, float(np.degrees(np.arccos(cos)))
+        tilt = float(np.degrees(np.arccos(cos)))
+        # Both readings are deviations from the resting pose, not absolutes.
+        # Height always was; tilt was not, and that mattered once the reference
+        # became a mesh axis rather than something derived from the registration
+        # pose: an object whose chosen axis rests a few tens of degrees off the
+        # normal then reported that constant offset as tilt forever, tripping the
+        # reset while tracking was in fact perfect.
+        return (height - self.plane_rest_offset,
+                abs(tilt - self.plane_rest_tilt))
 
     def check_reset_plane(self, pose: np.ndarray) -> bool:
         """Reset when the object has been off the table -- floating, sunk, or

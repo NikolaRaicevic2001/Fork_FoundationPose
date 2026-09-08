@@ -144,7 +144,14 @@ python3 fp_ros_node.py --ros-args \
     # You can replace mesh_file with different object meshes in ./meshes
 ```
 `self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
- 
+
+Check output (Optional)
+```bash
+docker exec -it ros2_sam2_foundationpose bash
+ros2 topic hz /object_pose
+ros2 topic echo /object_pose
+```
+
 **Terminal 4 — TF frame broadcast**
 ```bash
 docker exec -it ros2_sam2_foundationpose bash
@@ -155,11 +162,45 @@ python3 fp_tf_broadcaster.py --ros-args \
     -p camera_frame:=fp_camera_color_optical_frame
 ```
 
-**Terminal 5 — Check output (Optional)**
+**Terminal 5 -- ArUco obstacle detection** (live; (optional for obstacle scenes)
+
+Detects the 3 tagged clutter obstacles (obs_1/2/3) on the same camera feed, independent of SAM2/FoundationPose
 ```bash
 docker exec -it ros2_sam2_foundationpose bash
-ros2 topic hz /object_pose
-ros2 topic echo /object_pose
+source /opt/conda/etc/profile.d/conda.sh && conda activate my
+cd /home/erl-jackal/ycb_ws/Fork_FoundationPose
+export PYTHONPATH=""
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+python3 aruco_obstacle_node.py
+```
+
+**Terminal 6 -- bridge ArUco obstacle poses onto TF** (optional for obstacle scenes)
+
+Converts `/obstacle_pose/{obs_1,obs_2,obs_3}` topics into actual TF frames (`camera -> obs_N_tag -> obs_N_center`).
+
+```bash
+docker exec -it ros2_sam2_foundationpose bash
+source /opt/conda/etc/profile.d/conda.sh && conda activate my
+cd /home/erl-jackal/ycb_ws/Fork_FoundationPose
+export PYTHONPATH=""
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+python3 aruco_tf_broadcaster.py
+```
+Sanity check once this:
+```bash
+ros2 run tf2_ros tf2_echo xarm_device obs_1_center
+```
+
+**ArUco detection camera window** (optional)
+
+Live view of what `aruco_obstacle_node.py` is actually seeing -- detected tags get a green box + name label, rejected candidates get a red outline, with a `detected: N  rejected: M` counter. This is the window to check when a tag "isn't being detected" rather than guessing from the pose topics alone.
+
+```bash
+docker exec -it ros2_sam2_foundationpose bash
+export DISPLAY=:1
+python3 image_viewer.py /tmp/aruco_obstacle_vis.jpg
 ```
 
 ## TYLER DOCUMENTATION (September 8, 2024)
