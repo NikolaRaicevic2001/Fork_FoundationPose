@@ -75,7 +75,12 @@ class FoundationPoseROS2(Node):
         self.use_mask_gating = True
         self.mask_gating_min_pixels = 100  # below this, mask is empty -> skip gating
         self.mask_gating_dilate_px = 15  # grow mask to absorb mask/object lag
-        self.mask_gating_max_staleness_sec = 1.2  # skip gating if mask older (SAM2 ~1Hz)
+        # Skip gating when the mask is older than this. SAM2 currently runs at
+        # 3 Hz (a healthy mask is ~170 ms old), so tripping this means SAM2
+        # stalled or is re-initialising, not that the limit is too tight.
+        self.declare_parameter("mask_gating_max_staleness_sec", 1.2)
+        self.mask_gating_max_staleness_sec = self.get_parameter(
+            "mask_gating_max_staleness_sec").get_parameter_value().double_value
 
         # Auto-reset parameters for spatial drift detection
         self.use_auto_reset = True
@@ -220,7 +225,8 @@ class FoundationPoseROS2(Node):
         self.plane_n = None
         self.plane_d = None
         self.plane_u_ref = None  # object-frame axis that pointed "up" at reg.
-        self.plane_rest_offset = 0.0  # lowest-point distance when at rest
+        self.plane_rest_offset = 0.0  # centroid height when at rest
+        self.plane_rest_tilt = 0.0  # reference-axis tilt when at rest
         self.plane_violation_counter = 0
 
         # Refinement iterations
@@ -1217,13 +1223,16 @@ class FoundationPoseROS2(Node):
             self.plane_u_ref = pose[:3, :3].T @ self.plane_n
 
         self.plane_rest_offset = 0.0
-        metrics = self.plane_metrics(pose)
+        self.plane_rest_tilt = 0.0
+        metrics = self.plane_metrics(pose)  # raw, both offsets still zero
         if metrics is not None:
             self.plane_rest_offset = metrics[0]
+            self.plane_rest_tilt = metrics[1]
             self.get_logger().info(
-                f"Rest reference captured: offset="
+                f"Rest reference captured: height="
                 f"{self.plane_rest_offset * 1000:.1f} mm, "
-                f"tilt={metrics[1]:.1f} deg")
+                f"tilt={self.plane_rest_tilt:.1f} deg "
+                f"(both are now the zero point; thresholds apply to deviations)")
 
     def plane_metrics(self, pose: np.ndarray):
         """Return (float_height_m, tilt_deg), or None if the plane is not known.
@@ -1243,7 +1252,15 @@ class FoundationPoseROS2(Node):
         height = float(centroid @ self.plane_n + self.plane_d)
         up_now = rot @ self.plane_u_ref
         cos = float(np.clip(np.dot(up_now, self.plane_n), -1.0, 1.0))
-        return height - self.plane_rest_offset, float(np.degrees(np.arccos(cos)))
+        tilt = float(np.degrees(np.arccos(cos)))
+        # Both readings are deviations from the resting pose, not absolutes.
+        # Height always was; tilt was not, and that mattered once the reference
+        # became a mesh axis rather than something derived from the registration
+        # pose: an object whose chosen axis rests a few tens of degrees off the
+        # normal then reported that constant offset as tilt forever, tripping the
+        # reset while tracking was in fact perfect.
+        return (height - self.plane_rest_offset,
+                abs(tilt - self.plane_rest_tilt))
 
     def check_reset_plane(self, pose: np.ndarray) -> bool:
         """Reset when the object has been off the table -- floating, sunk, or
