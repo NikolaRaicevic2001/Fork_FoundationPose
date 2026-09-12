@@ -212,10 +212,11 @@ class ArucoObstacleNode(Node):
                     continue  # some other tag in frame, not one of ours
                 ok, rvec, tvec = cv2.solvePnP(
                     self.obj_points, corners[i][0], self.latest_cam_K,
-                    self.latest_dist)
+                    self.latest_dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
                 if not ok:
                     continue
-                tvec = self._refine_translation_from_depth(corners[i][0], tvec)
+                tvec = self._refine_translation_from_depth(
+                    corners[i][0], tvec, frame.shape[:2], MARKER_IDS[marker_id])
                 self.publish_pose(marker_id, rvec, tvec, stamp)
                 if self.visualize:
                     cv2.drawFrameAxes(vis, self.latest_cam_K, self.latest_dist,
@@ -246,23 +247,45 @@ class ArucoObstacleNode(Node):
                                        throttle_duration_sec=5.0)
 
     def _refine_translation_from_depth(
-        self, corners_2d: np.ndarray, tvec: np.ndarray
+        self, corners_2d: np.ndarray, tvec: np.ndarray,
+        rgb_shape: tuple, name: str,
     ) -> np.ndarray:
         """Replace solvePnP's translation with one backed by measured
         depth at the tag's own pixel footprint -- see the module
-        docstring for why. Falls back to solvePnP's own tvec, unchanged,
-        if depth isn't available yet or the tag's pixel is a hole."""
+        docstring for why. Falls back to solvePnP's own tvec, with a
+        warning, if depth isn't available, isn't the color frame's size,
+        or the tag's pixel is a hole."""
         if self.latest_depth is None:
-            return tvec
+            return self._pnp_fallback(name, tvec, "no depth image yet")
+        if self.latest_depth.shape[:2] != tuple(rgb_shape):
+            return self._pnp_fallback(
+                name, tvec,
+                f"depth {self.latest_depth.shape[:2]} != color "
+                f"{tuple(rgb_shape)}, is depth aligned to color?")
         u, v = corners_2d.mean(axis=0)
         z = depth_at_pixel(self.latest_depth, u, v)
         if z is None:
-            return tvec
+            return self._pnp_fallback(name, tvec, "no valid depth at tag")
+        z_pnp = float(tvec[2, 0])
+        if abs(z / z_pnp - 1.0) > 0.15:
+            self.get_logger().warn(
+                f"{name}: depth {z:.3f} m vs solvePnP {z_pnp:.3f} m "
+                f"(x{z / z_pnp:.2f}); check MARKER_LENGTH_M="
+                f"{MARKER_LENGTH_M} against the printed tag",
+                throttle_duration_sec=5.0)
         fx, fy = self.latest_cam_K[0, 0], self.latest_cam_K[1, 1]
         cx, cy = self.latest_cam_K[0, 2], self.latest_cam_K[1, 2]
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy
         return np.array([[x], [y], [z]], dtype=np.float64)
+
+    def _pnp_fallback(self, name: str, tvec: np.ndarray,
+                      reason: str) -> np.ndarray:
+        """solvePnP's translation, logged so a missing depth path is seen."""
+        self.get_logger().warn(
+            f"{name}: translation from solvePnP, not depth ({reason})",
+            throttle_duration_sec=5.0)
+        return tvec
 
     def publish_pose(self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray,
                       stamp) -> None:
