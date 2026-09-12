@@ -47,6 +47,12 @@ RUN cd / && wget --quiet \
 
 ENV PATH $PATH:/opt/conda/envs/my/bin
 
+# TORCH_CUDA_ARCH_LIST covers every card this repo runs on: 7.5 RTX
+# 2080 Ti (robot computer), 8.6 RTX 3080 Ti, 8.9 Ada / RTX 4080 laptop.
+# Was 8.9 alone, which built kernels no other card could load -- every
+# extension then died with 'no kernel image is available for execution
+# on the device' at its first CUDA call (2026-09-11). Longer build,
+# but one image that works everywhere.
 # torch (CUDA 12.1) + pytorch3d in one RUN block.
 # conda activate does not persist across RUN layers; ENV PATH above ensures
 # the `my` env pip is used directly without needing activate.
@@ -56,7 +62,7 @@ RUN conda init bash && \
     pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1 \
         --index-url https://download.pytorch.org/whl/cu121 && \
     pip install fvcore iopath && \
-    FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.9" \
+    FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9" \
         pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable" \
         --no-build-isolation
 
@@ -65,10 +71,10 @@ RUN pip install scipy joblib scikit-learn ruamel.yaml "trimesh==3.23.5" pyyaml \
         "opencv-python==4.10.0.84" imageio open3d transformations warp-lang einops \
         kornia pyrender
 
-# nvdiffrast (CUDA extension; arch 8.9 = RTX 4080 Ada)
+# nvdiffrast (CUDA extension; multi-arch, see note above)
 RUN cd / && git clone https://github.com/NVlabs/nvdiffrast && \
     cd /nvdiffrast && \
-    TORCH_CUDA_ARCH_LIST="8.9" pip install . --no-build-isolation
+    TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9" pip install . --no-build-isolation
 
 ENV OPENCV_IO_ENABLE_OPENEXR=1
 

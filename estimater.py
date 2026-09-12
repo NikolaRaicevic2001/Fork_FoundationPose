@@ -24,7 +24,29 @@ class FoundationPose:
     os.makedirs(debug_dir, exist_ok=True)
 
     self.reset_object(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh)
-    self.make_rotation_grid(min_n_views=40, inplane_step=60)
+    # 2026-09-11, RTX 2080 Ti (11 GB). Upstream default: 42 icosphere
+    # views x 360/inplane_step in-plane rotations = 252 hypotheses at
+    # inplane_step=60.
+    #
+    # This registration OOM'd once here, not because 252 is too many but
+    # because the desktop was holding 1131 MB of VRAM (a second user's X
+    # session, firefox, gnome-shell). With that down to ~950 MB the stock
+    # 252 fits: measured demand was ~6219 MB against ~6576 MB free once
+    # SAM2's 3738 MB and the desktop are accounted for.
+    #
+    # The peak is `transform_depth_to_xyzmap` in h5_dataset.py, which
+    # warps ALL candidates at full resolution in one tensor
+    # (252 * 848 * 480 * 4 B ~ 410 MB). The `bs=512` loops in
+    # predict_score / predict_pose_refine do NOT bound it -- at 252 < 512
+    # they are already a single chunk. So candidate count is the only
+    # lever on that peak short of chunking the transform itself.
+    #
+    # 252 OOM'd on this card even after freeing the desktop VRAM, so the
+    # grid is built at the upstream inplane_step=60 and then capped to
+    # 225 hypotheses (2026-09-11, per Shahid). That is an 11% cut, worth
+    # ~44 MB off the ~410 MB warp tensor -- small, so if registration
+    # still OOMs the cap is the knob to lower, not inplane_step.
+    self.make_rotation_grid(min_n_views=40, inplane_step=60, max_hypotheses=225)
 
     self.glctx = glctx
 
@@ -103,7 +125,7 @@ class FoundationPose:
 
 
 
-  def make_rotation_grid(self, min_n_views=40, inplane_step=60):
+  def make_rotation_grid(self, min_n_views=40, inplane_step=60, max_hypotheses=None):
     cam_in_obs = sample_views_icosphere(n_views=min_n_views)
     logging.info(f'cam_in_obs:{cam_in_obs.shape}')
     rot_grid = []
@@ -120,6 +142,18 @@ class FoundationPose:
     rot_grid = mycpp.cluster_poses(30, 99999, rot_grid, self.symmetry_tfs.data.cpu().numpy())
     rot_grid = np.asarray(rot_grid)
     logging.info(f"after cluster, rot_grid:{rot_grid.shape}")
+    # Hard cap on hypothesis count, for VRAM (see the call site). The
+    # icosphere gives discrete view counts (12, 42, 162 ...) and
+    # inplane_step only divides 360, so neither reaches an arbitrary
+    # target -- subsample the finished grid instead. Evenly spaced over
+    # the view-major ordering rather than truncated, so dropping entries
+    # thins the grid uniformly instead of deleting whole view directions
+    # off the end.
+    if max_hypotheses is not None and len(rot_grid) > max_hypotheses:
+      keep = np.unique(
+        np.linspace(0, len(rot_grid) - 1, max_hypotheses).round().astype(int))
+      rot_grid = rot_grid[keep]
+      logging.info(f"capped rot_grid:{rot_grid.shape}")
     self.rot_grid = torch.as_tensor(rot_grid, device='cuda', dtype=torch.float)
     logging.info(f"self.rot_grid: {self.rot_grid.shape}")
 

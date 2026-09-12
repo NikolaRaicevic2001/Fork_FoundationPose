@@ -83,9 +83,15 @@ RUN PYTHONPATH='' conda run -n my pip install --no-build-isolation \
 RUN echo "/opt/sam2" \
     > /opt/conda/envs/my/lib/python3.11/site-packages/sam2.pth
 
-# Build the sam2._C CUDA extension for arch 8.9 (RTX 4080 Ada).
+# Build the sam2._C CUDA extension.
+# TORCH_CUDA_ARCH_LIST covers every card this repo runs on: 7.5 RTX
+# 2080 Ti (robot computer), 8.6 RTX 3080 Ti, 8.9 Ada / RTX 4080 laptop.
+# Was 8.9 alone, which built kernels no other card could load -- every
+# extension then died with 'no kernel image is available for execution
+# on the device' at its first CUDA call (2026-09-11). Longer build,
+# but one image that works everywhere.
 RUN cd /opt/sam2 \
-    && PYTHONPATH='' TORCH_CUDA_ARCH_LIST="8.9" conda run -n my \
+    && PYTHONPATH='' TORCH_CUDA_ARCH_LIST="7.5;8.6;8.9" conda run -n my \
        python setup.py build_ext --inplace
 
 # _C.so links against libc10.so / libtorch. Append to the activation script
