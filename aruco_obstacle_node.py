@@ -67,7 +67,7 @@ DICTIONARY = cv2.aruco.DICT_4X4_50
 # a ruler (the black/white pattern only, not the white print margin)
 # whenever the tags are reprinted, even though depth now absorbs most
 # of a mismatch here.
-MARKER_LENGTH_M = 0.085
+MARKER_LENGTH_M = 0.05
 # RealSense's own convention: raw uint16 millimeters. Aligned to the
 # color frame, same topic fp_ros_node.py's own depth_callback reads.
 DEPTH_TOPIC_DEFAULT = "/camera/aligned_depth_to_color/image_raw"
