@@ -12,7 +12,8 @@
 
 docker rm -f ros2_sam2_foundationpose
 DIR=$(pwd)/../
-xhost + && docker run --gpus all \
+X_DISPLAY=:1
+DISPLAY=$X_DISPLAY xhost + && docker run --gpus all \
   --env NVIDIA_DISABLE_REQUIRE=1 \
   -it --network=host \
   --name ros2_sam2_foundationpose \
@@ -22,6 +23,6 @@ xhost + && docker run --gpus all \
   -v $DIR:$DIR -v /home:/home -v /mnt:/mnt \
   -v /tmp/.X11-unix:/tmp/.X11-unix -v /tmp:/tmp \
   --ipc=host \
-  -e DISPLAY=${DISPLAY} \
+  -e DISPLAY=$X_DISPLAY \
   -e GIT_INDEX_FILE \
   ros2_sam2_foundationpose:latest bash -c "cd $DIR && export PYTHONPATH='' && bash"
