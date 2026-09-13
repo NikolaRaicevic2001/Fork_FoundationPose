@@ -228,6 +228,18 @@ class FoundationPoseROS2(Node):
         self.declare_parameter("canonical_flip", False)
         self.canonical_flip = self.get_parameter(
             "canonical_flip").get_parameter_value().bool_value
+        # Where the sign of that reference axis comes from. "obb": as
+        # trimesh's oriented bounding box returns it, which differs between
+        # meshes (T_block -z, T_large_block +z), so no single canonical_flip
+        # fits every mesh. "mesh": along the mesh file's own axis, so
+        # canonical_flip:=false keeps the mesh's +axis up for every mesh.
+        self.declare_parameter("canonical_anchor", "obb")
+        self.canonical_anchor = self.get_parameter(
+            "canonical_anchor").get_parameter_value().string_value
+        if self.canonical_anchor not in ("obb", "mesh"):
+            raise ValueError(
+                f"canonical_anchor must be 'obb' or 'mesh', got "
+                f"{self.canonical_anchor!r}")
         # Only switch representation when the alternative is better by this
         # margin, so a pose sitting near the midpoint cannot chatter.
         self.declare_parameter("canonical_switch_margin_deg", 20.0)
@@ -1239,8 +1251,8 @@ class FoundationPoseROS2(Node):
         each run would adopt whichever representation it happened to draw.
 
         With canonicalisation on, anchor it to the MESH instead: the
-        bounding-box axis most aligned with the table normal, keeping the sign
-        the mesh file gives it. The axis choice is identical in either
+        bounding-box axis most aligned with the table normal, its sign set by
+        `canonical_anchor`. The axis choice is identical in either
         representation (a symmetry maps each axis to plus or minus itself, so
         the alignment magnitudes are unchanged) and the sign never consults the
         pose. Every run then converges on the same representation."""
@@ -1253,10 +1265,14 @@ class FoundationPoseROS2(Node):
                     abs(float(np.dot(pose[:3, :3] @ axis, self.plane_n))))
             best = int(np.argmax(aligns))
             base = axes[best] / np.linalg.norm(axes[best])
+            if (self.canonical_anchor == "mesh"
+                    and base[int(np.argmax(np.abs(base)))] < 0):
+                base = -base
             self.plane_u_ref = -base if self.canonical_flip else base
             self.get_logger().info(
                 f"Rest reference anchored to mesh axis {np.round(base, 3)} "
-                f"(alignments {np.round(aligns, 3)}, flip={self.canonical_flip})")
+                f"(alignments {np.round(aligns, 3)}, "
+                f"anchor={self.canonical_anchor}, flip={self.canonical_flip})")
         else:
             self.plane_u_ref = pose[:3, :3].T @ self.plane_n
         self.plane_rest_offset = 0.0

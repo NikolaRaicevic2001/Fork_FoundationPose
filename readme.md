@@ -135,7 +135,7 @@ python3 fp_ros_node.py --ros-args \
     -p camera:=realsense \
     -p plane_mode:=detect \
     -p canonicalize:=true \
-    -p canonical_flip:=true \
+    -p canonical_anchor:=mesh \
     -p use_iou_reset:=true \
     -p iou_reset_thresh:=0.7 \
     -p pose_ema_window:=3 \
@@ -143,6 +143,8 @@ python3 fp_ros_node.py --ros-args \
     -p mesh_file:=meshes/T_block/T_block.ply
     # You can replace mesh_file with different object meshes in ./meshes
 ```
+`canonical_anchor:=mesh` keeps each mesh's own +z up, for every mesh in `./meshes`. The default `obb` takes the up sign from trimesh's bounding box, which differs per mesh (T_block and T_large_block disagree), so one `canonical_flip` value cannot serve both. Check the init log: `Rest reference anchored to mesh axis [0. 0. 1.] (... anchor=mesh, flip=False)`.
+
 `self.diameter:0.12...` in the init log confirms the mm→m mesh conversion applied (pre-conversion it reads ~120.5). Once a mask arrives, registration runs, then tracking starts and `Tracking done in NN ms` repeats.
 
 Check output (Optional)
