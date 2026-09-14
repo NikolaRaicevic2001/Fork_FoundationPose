@@ -22,6 +22,7 @@ DISPLAY=$X_DISPLAY xhost + && docker run --gpus all \
   -v /dev:/dev \
   -v $DIR:$DIR -v /home:/home -v /mnt:/mnt \
   -v /tmp/.X11-unix:/tmp/.X11-unix -v /tmp:/tmp \
+#   -v $PWD/cyclonedds_pointtopoint.xml:/root/cyclonedds.xml \
   --ipc=host \
   -e DISPLAY=$X_DISPLAY \
   -e GIT_INDEX_FILE \
